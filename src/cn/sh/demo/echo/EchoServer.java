@@ -1,12 +1,13 @@
 package cn.sh.demo.echo;
 
 import io.netty.bootstrap.ServerBootstrap;
-import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 
 import java.net.InetSocketAddress;
 
@@ -30,9 +31,9 @@ public class EchoServer {
                 //使用指定的端口套接字
                 .localAddress(new InetSocketAddress(port))
                 //添加一个EchoServerHandler到子Channel的ChannelPipeline
-                .childHandler(new ChannelInitializer<NioServerSocketChannel>() {
+                .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
-                    protected void initChannel(NioServerSocketChannel channel) throws Exception {
+                    protected void initChannel(SocketChannel channel) throws Exception {
                         //此处由于EchoServerHandler被注解标注为@Shareble，所以我们总是使用相同的实例
                         channel.pipeline().addLast(serverHandler);
                     }
@@ -52,7 +53,7 @@ public class EchoServer {
 
     public static void main(String[] args) throws InterruptedException {
         if (args.length != 1) {
-            System.err.println("缺少参数");
+            System.err.println("参数类型或者个数不正确");
             return;
         }
         //设置端口值
