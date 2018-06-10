@@ -28,7 +28,6 @@ public class EchoServerHandler extends ChannelInboundHandlerAdapter {
     public void channelReadComplete(ChannelHandlerContext ctx) {
         //将消息冲刷到客户端，并且关闭该Channel
         ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
-        ctx.write(Unpooled.EMPTY_BUFFER)
     }
 
     @Override
