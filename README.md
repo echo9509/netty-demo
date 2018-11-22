@@ -60,3 +60,17 @@ Netty提供了大量的默认的ByteProcessor，来对常用的查找自己进�
 1. duplicate()：返回当前ByteBuf的复制对象，复制后返回的ByteBuf与操作的ByteBuf共享缓冲区内容，但是维护自己独立的读写索引。当修改复制后的ByteBuf内容后，
 原ByteBuf的内容也随之改变，因为双方持有的是同一个内容的指针引用。
 2. copy()：复制一个新的ByteBuf对象，内容和索引都与原ByteBuf独立，复制操作本身并不修改原ByteBuf的读写索引
+3. copy(int index, int length)：复制一个新的ByteBuf对象，复制开始的索引为index，复制的长度为length
+3. slice()：返回与当前ByteBuf的可读子缓冲区，范围是readIndex ~ writeIndex，返回后的ByteBuf与原ByteBuf内容共享，读写索引独立维护，
+maxCapacity是当前ByteBuf的可读字节数(换句话说就是这个新返回的缓冲区不能再进行写入)
+4. slice(int index, int length)：返回index开始，length长度的当前ByteBuf的子缓冲区，返回后的ByteBuf与原ByteBuf内容共享，读写索引独立维护，
+maxCapacity是length(换句话说就是这个新返回的缓冲区不能再进行写入)
+
+## 转换成标准的ByteBuffer
+1. ByteBuffer nioBuffer()：将当前ByteBuf可读的缓冲区转换成ByteBuffer，两者共享同一个缓冲区内容引用，对ByteBuffer的读写操作并不会修改原ByteBuf的读写索引。
+返回后的ByteBuffer无法感知ByteBuf的动态扩展。
+2. ByteBuffer nioBuffer(int index, int length)：从ByteBuf的index位置开始长度为length的缓冲区转换成ByteBuffer，两者共享同一个缓冲区内容引用，
+对ByteBuffer的读写操作并不会修改原ByteBuf的读写索引。返回后的ByteBuffer无法感知ByteBuf的动态扩展。
+
+## 随机读写
+主要通过set和get开头的方法，这两个方法可以指定索引位置。
