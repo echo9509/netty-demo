@@ -109,3 +109,22 @@ ResourceLeakDetector主要用来检测对象是否泄漏。
 选取writeBytes(byte[] src, int srcIndex, int length)分析：
 1. 首先对缓冲区的可写空间进行校验：如果要写入的长度(length) < 0，会抛出IllegalArgumentException异常；如果要写入的长度小于缓冲区可写入的字节数，表明可写；
 如果要写入的长度 > 最大容量 - writeIndex，会抛出IndexOutOfBoundsException；否则进行扩容操作（扩容操作的原理前面已经讲过）。
+
+### 操作索引
+与索引相关的操作主要涉及设置读写索引、mark、和reset等。
+
+选取readerIndex(int readerIndex)进行分析：
+1. 首先对索引合法性进行判断：如果readerIndex小于0或者readerIndex > writeIndex，则抛出IndexOutOfBoundsException异常
+2. 校验通过之后，将读索引设置为readerIndex
+
+### 重用缓冲区
+选取discardReadBytes()进行分析：
+1. 如果readIndex等于0，直接返回
+2. 如果readIndex和writeIndex不相等，首先调用setBytes(int index, ByteBuf src, int srcIndex, int length)方法进行字节数组的复制，
+然后重新设置markReadIndex、markWriteIndex、readIndex和writeIndex
+3. 如果readIndex等于writeIndex，调整markReadIndex和markWriteIndex，不进行字节数组复制，设置readIndex=writeIndex=0
+
+### skipBytes
+1. 校验跳过的字节长度：如果跳过的字节长度小于0，则抛出IllegalArgumentException异常，如果跳过的字节数大于可读取的字节数，
+则抛出IndexOutOfBoundsException异常
+2. 校验通过之后，readIndex增加跳过的字节长度
