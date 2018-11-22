@@ -128,3 +128,14 @@ ResourceLeakDetector主要用来检测对象是否泄漏。
 1. 校验跳过的字节长度：如果跳过的字节长度小于0，则抛出IllegalArgumentException异常，如果跳过的字节数大于可读取的字节数，
 则抛出IndexOutOfBoundsException异常
 2. 校验通过之后，readIndex增加跳过的字节长度
+
+## AbstractReferenceCountedByteBuf
+该类主要是对引用进行计数，类似于JVM内存回收的对象引用计数器，用于跟踪对象的分配和销毁，做自动内存回收。
+
+### 成员变量
+1. AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> refCntUpdater对象：通过原子的方式对成员变量进行更新操作，实现线程安全，消除锁。
+2. volatile int refCnt：用于跟踪对象的引用次数，使用volatile是为了解决多线程并发访问的可见性问题。
+
+### 对象引用计数器
+每调用retain()方法一次，引用计数器就会加1，但加完之后会对数据进行校验，具体的校验内容如下：
+如果加1之前的引用次数小于等于0或者原来的引用次数 + 增加的次数 < 原来的引用次数，则需要还原这次引用计数器增加操作，并且抛出IllegalReferenceCountException异常
