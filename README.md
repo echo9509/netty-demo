@@ -74,3 +74,38 @@ maxCapacity是length(换句话说就是这个新返回的缓冲区不能再进�
 
 ## 随机读写
 主要通过set和get开头的方法，这两个方法可以指定索引位置。
+
+# ByteBuf源码
+从内存分配的角度来看，ByteBuf主要分为以下两类：
+1. 堆内存(HeapByteBuf)字节缓冲区：内存分配和回收速度快，可以被JVM自动回收；缺点是如果Socket进行I/O读写，需要进行一次内存复制，将堆内存对应的缓冲区复制到内核
+Channel中，性能会有所下降
+2. 直接内存(DirectByteBuf)字节缓冲区：堆外内存直接分配，相比于堆内存，分配和回收速度比较慢，但是在Socket Channel中进行读写比较快(少一次内存复制)
+
+ByteBuf的最佳时间是在I/O通信线程的读写缓冲区使用DirectByteBuf，后端业务消息的编解码模块使用HeapByteBuf。
+
+从内存回收的角度进行分类：
+1. 基于对象池的ByteBuf：自己维护了一个内存池，可以重复利用ByteBuf对象，提升内存使用率，降低GC频率
+2. 普通的ByteBuf
+
+## AbstractByteBuf
+AbstractByteBuf继承ByteBuf，ByteBuf中的一些公共属性和方法会在AbstractByteBuf中实现。
+### 主要变量
+1. ResourceLeakDetector<ByteBuf> leakDetector对象：被定义为static，所有的ByteBuf实例共享一个ResourceLeakDetector<ByteBuf> leakDetector对象。
+ResourceLeakDetector主要用来检测对象是否泄漏。
+2. 索引设置：读写索引、重置读写索引、最大容量
+
+### 读操作
+读操作的公共功能由父类实现，差异化由具体的子类实现。
+
+选取readBytes(byte[] dst, int dstIndex, int length)分析：
+1. 首先对缓冲区可读空间进行校验：如果读取的长度(length) < 0，会抛出IllegalArgumentException异常；如果可读的字节数小于需要读取的长度(length)，
+会抛出IndexOutOfBoundsException异常
+2. 校验通过之后，调用getBytes方法从当前的读索引开始进行读取（这一块就需要由真正的子类来各自实现），复制length个字节到目标byte数组，数组开始的位置是dstIndex
+3. 读取成功后，对读索引进行递增，增加的长度为length
+
+### 写操作
+写操作的公共功能由父类实现，差异化由具体的子类实现。
+
+选取writeBytes(byte[] src, int srcIndex, int length)分析：
+1. 首先对缓冲区的可写空间进行校验：如果要写入的长度(length) < 0，会抛出IllegalArgumentException异常；如果要写入的长度小于缓冲区可写入的字节数，表明可写；
+如果要写入的长度 > 最大容量 - writeIndex，会抛出IndexOutOfBoundsException；否则进行扩容操作（扩容操作的原理前面已经讲过）。
