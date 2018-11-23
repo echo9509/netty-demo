@@ -198,3 +198,18 @@ Page中存储区域的使用状态通过一个long数组来维护，数组中每
 
 ### 内存回收策略
 Chunk和Page都通过状态位来标识内存是否可用，不同的是Chunk通过在二叉树上对节点进行标识实现，Page是通过维护块的使用状态标识来实现。
+
+## PooledDirectByteBuf
+PooledDirectByteBuf基于内存池实现。
+
+### 创建字节缓冲区实例
+新创建PooledDirectByteBuf对象不能直接new，而是从内存池Recycler<PooledDirectByteBuf>中获取，然后设置引用计数器的值为1，设置缓冲区的最大空间，
+设置读写索引、标记读写索引为0。
+
+### 复制新的字节缓冲区实例
+copy(int index, int length)方法可以复制一个ByteBuf实例，并且与原来的ByteBuf相互独立。
+
+1. 首先校验索引和长度的合法性
+2. 校验通过之后，调用PooledByteBufAllocator分配一个新的ByteBuf，最终会调用PooledByteBufAllocator中的
+newDirectBuffer(int initialCapacity, int maxCapacity)方法进行内存的分配
+3. 在newDirectBuffer中，直接从缓存中获取ByteBuf而不是创建一个新的对象
