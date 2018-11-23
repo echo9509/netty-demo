@@ -10,10 +10,10 @@ import java.nio.ByteBuffer;
 public class Test {
 
     public static void main(String[] args) throws UnsupportedEncodingException {
-//        duplicate();
+        duplicate();
 //        copy();
 //        slice();
-        nioByteBuffer();
+//        nioByteBuffer();
     }
 
     public static  void duplicate() {
@@ -25,9 +25,13 @@ public class Test {
         System.out.println(duplicate.readerIndex());
         duplicate.setBytes(3, "跑".getBytes());
         System.out.println(byteBuf.toString(CharsetUtil.UTF_8));
+        System.out.println(duplicate.toString(CharsetUtil.UTF_8));
         byteBuf.readBytes(3);
+        duplicate.writeBytes("哈哈哈哈哈哈".getBytes());
+        byteBuf.writerIndex(duplicate.writerIndex());
         System.out.println(byteBuf.readerIndex());
         System.out.println(duplicate.readerIndex());
+        System.out.println(byteBuf.toString(CharsetUtil.UTF_8));
         System.out.println(duplicate.toString(CharsetUtil.UTF_8));
     }
 

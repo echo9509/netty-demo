@@ -139,3 +139,35 @@ ResourceLeakDetector主要用来检测对象是否泄漏。
 ### 对象引用计数器
 每调用retain()方法一次，引用计数器就会加1，但加完之后会对数据进行校验，具体的校验内容如下：
 如果加1之前的引用次数小于等于0或者原来的引用次数 + 增加的次数 < 原来的引用次数，则需要还原这次引用计数器增加操作，并且抛出IllegalReferenceCountException异常
+
+## UnpooledHeapByteBuf
+UnpooledHeapByteBuf是基于堆内存分配的字节缓冲区，每次I/O读写都会创建一个新的UnpooledHeapByteBuf。
+
+### 成员变量
+1. ByteBufAllocator alloc：用于UnpooledHeapByteBuf的内存分配
+2. byte[] array：缓冲区数组，此处也可用ByteBuffer，但是用byte数组的原因是提升性能和更加便捷的进行位操作
+3. ByteBuffer tmpNioBuf：用于实现Netty的ByteBuf到JDK NIO ByteBuffer的转换
+
+### 动态扩展缓冲区
+1. 校验新容量：如果新容量小于0或者新容量大于最大容量，抛出IllegalArgumentException异常，否则校验通过
+2. 如果新容量大于旧容量，使用new byte\[newCapacity]创建新的缓冲数组，然后通过System.arraycopy进行复制，将旧的缓冲区内容拷贝到新的缓冲区中，
+最后在ByteBuf中替换旧的数组，并且将原来的ByteBuffer tmpNioBuf置为空
+3. 如果新容量小于旧容量，使用new byte\[newCapacity]创建新的缓冲数组，如果读索引小于新容量(如果写索引大于新容量，将写索引直接置为新容量)，然后通过System.arraycopy将当前
+可读的缓冲区内容复制到新的byte数组，如果读索引大于新容量，说明没有可以拷贝的缓冲区，直接将读写索引置为新容量，并且使用新的byte数组替换原来的字节数组
+
+### 字节数组复制
+setBytes(int index, byte[] src, int srcIndex, int length)
+
+1. 首先是合法性校验，先是校验index，length，如果这两个值有小于0，或者相加小于0，或者两个相加大于ByteBuf的容量，则抛出IndexOutOfBoundsException异常，
+接着校验被复制的数组的长度和索引问题(srcIndex、length)，如果srcIndex、length小于0，或者两个相加小于0，或者两个相加超过了src字节数组的容量，也抛出IndexOutOfBoundsException异常
+2. 校验通过之后，使用System.arraycopy方法进行字节数组的拷贝
+
+ByteBuf以get和set开头读写缓冲区的方法不会修改读写索引
+
+### 转换成JDK ByteBuffer
+由于UnpooledHeapByteBuf缓冲区采用了byte数组实现，同样的ByteBuffer底层也是用了byte数组实现，同时ByteBuffer还提供了wrap方法，
+直接将字节数组转换成ByteBuffer，最后调用slice方法。由于每次调用都会创建一个新的ByteBuffer，因此起不到重用缓冲区内容的效果。
+
+### 子类实现相关的方法
+1. hasArray()：是否支持数组，判断缓冲区的实现是否基于字节数组
+2. array()：如果缓冲区的实现基于字节数组，返回字节数组
