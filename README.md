@@ -213,3 +213,39 @@ copy(int index, int length)方法可以复制一个ByteBuf实例，并且与原�
 2. 校验通过之后，调用PooledByteBufAllocator分配一个新的ByteBuf，最终会调用PooledByteBufAllocator中的
 newDirectBuffer(int initialCapacity, int maxCapacity)方法进行内存的分配
 3. 在newDirectBuffer中，直接从缓存中获取ByteBuf而不是创建一个新的对象
+
+# ByteBuf辅助类
+## ByteBufHolder
+ByteBufHolder是BytBuf容器。比如，Http协议的请求消息和应答消息都可以携带消息体，这个消息体在Netty中就是ByteBuf对象。由于不同的协议消息体可以包含不同的
+协议字段和功能，因此需要对ByteBuf进行包装和抽象，为了满足这些定制化的需求，Netty抽象出了ByteBufHolder对象。
+
+## ByteBufAllocator
+ByteBufAllocator是字节缓冲区分配器，按照Netty缓冲区的实现不同可以分为：基于内存池的字节缓冲区分配器和普通的字节缓冲区分配器。
+
+方法名称 | 返回值说明 | 功能说明
+--- | --- | ---
+buffer() | ByteBuf | 分配一个字节缓冲区，缓冲区的类型由ByteBufAllocator的实现类决定
+buffer(int initialCapacity) | ByteBuf | 分配一个初始容量为initialCapacity的字节缓冲区，缓冲区的类型由ByteBufAllocator的实现类决定
+buffer(int initialCapacity, int maxCapacity) | ByteBuf | 分配一个初始容量为initialCapacity，最大容量为maxCapacity的字节缓冲区，缓冲区的类型由ByteBufAllocator的实现类决定
+ioBuffer(int initialCapacity, int maxCapacity) | ByteBuf | 分配一个初始容量为initialCapacity，最大容量为maxCapacity的Direct Buffer，Direct Buffer I/O性能高
+heapBuffer(int initialCapacity, int maxCapacity) | ByteBuf | 分配一个初始容量为initialCapacity，最大容量为maxCapacity的Heap Buffer
+directBuffer(int initialCapacity, int maxCapacity) | ByteBuf | 分配一个初始容量为initialCapacity，最大容量为maxCapacity的Direct Buffer
+compositeBuffer(int maxNumComponents) | CompositeByteBuf | 分配一个最多包含maxNumComponents个缓冲区的复合缓冲区，缓冲区的类型由ByteBufAllocator的实现类决定
+isDirectBufferPooled() | boolean | 是否使用了直接内存池
+calculateNewCapacity(int minNewCapacity, int maxCapacity) | int | 动态扩容时计算新容量
+
+## CompositeByteBuf
+CompositeByteBuf允许将多个ByteBuf的实例组装到一起。
+
+CompositeByteBuf定义了一个Component类型的集合，Component实际上是ByteBuf的包装实现类，它聚合了ByteBuf对象，维护ByteBuf在集合中的位置偏移量等信息。
+
+CompositeByteBuf支持动态增加(addComponent(ByteBuf buffer))和删除(removeComponent(int cIndex))ByteBuf，增加或删除ByteBuf之后，
+需要更新各个ByteBuf的索引偏移量。
+
+## ByteBufUtil
+ByteBufUtil提供了大量的静态方法来操作ByteBuf。列举三个：
+1. ByteBuf encodeString(ByteBufAllocator alloc, CharBuffer src, Charset charset)：对需要编码的字符串src按照指定的字符集charset进行编码，利用指定的
+ByteBufAllocator生成一个ByteBuf
+2. decodeString(ByteBuf src, int readerIndex, int len, Charset charset)：从指定索引readIndex开始往后len个字节长度，对ByteBuf对象src按照指定的
+字符集charset进行解码
+3. hexDump(ByteBuf buffer)：将ByteBuf对象的参数内容以十六进制的格式输出
