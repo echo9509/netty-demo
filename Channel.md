@@ -71,3 +71,127 @@ ChannelId的可能生成策略如下：
 4. 当前系统时间纳秒数——System.nanoTime()
 5. 32位的随机整形数
 6. 32位自增的序列数
+
+## Channel源码
+### Channel继承关系类图
+服务端NioServerSocketChannel继承关系图
+![FF7QMQ.png](https://s1.ax1x.com/2018/11/24/FF7QMQ.png)
+
+客户端NioSocketChannel继承关系图
+![FF7URU.png](https://s1.ax1x.com/2018/11/24/FF7URU.png)
+
+### AbstractChannel源码
+#### 成员变量定义
+![FF7ci6.png](https://s1.ax1x.com/2018/11/24/FF7ci6.png)
+1. 首先定义了5个静态全局异常
+2. Channel parent：代表父类Channel
+3. ChannelId id：采用默认方式生成的全局唯一ID
+4. Unsafe unsafe：Unsafe实例
+5. DefaultChannelPipeline pipeline：当前Channel对应的DefaultChannelPipeline
+6. EventLoop eventLoop：当前Channel注册的EventLoop等一系列
+
+通过变量定义可以看出，AbstractChannel聚合了所有Channel使用到的能力对象，由AbstractChannel提供初始化和统一封装，如果功能和子类强相关，则
+定义成抽象方法由子类具体实现。
+
+#### 核心API
+Netty基于事件驱动，当Channel进行I/O操作时会产生对应的I/O事件，然后驱动事件在ChannelPipeline中传播，由对应的ChannelHandler对事件进行拦截
+和处理，不关心的事件可以直接忽略。
+
+网络I/O操作直接调用DefaultChannelPipeline的相关方法，由DefaultChannelPipeline中对应的ChannelHandler进行具体的逻辑处理。
+
+AbstractChannel提供了一些公共API的具体实现，例如localAddress()和remoteAddress()，下面看一下remoteAddress的源码：
+```java
+    @Override
+    public SocketAddress remoteAddress() {
+        SocketAddress remoteAddress = this.remoteAddress;
+        if (remoteAddress == null) {
+            try {
+                this.remoteAddress = remoteAddress = unsafe().remoteAddress();
+            } catch (Throwable t) {
+                // Sometimes fails on a closed socket in Windows.
+                return null;
+            }
+        }
+        return remoteAddress;
+    }
+```
+首先从缓存的成员变量中获取，如果第一次调用为空，需要通过unsafe的remoteAddress获取，它是个抽象方法，具体由对应的Channel子类实现。
+
+### AbstractNioChannel源码
+#### 成员变量定义
+![FFLmwj.png](https://s1.ax1x.com/2018/11/24/FFLmwj.png)
+1. 定义了一个DO_CLOSE_CLOSED_CHANNEL_EXCEPTION静态全局异常
+2. SelectableChannel ch：由于NIO Channel、NioSocketChannel和NioServerSocketChannel需要公用，所以定义了一个SocketChannel和
+ServerSocketChannel的公共父类SelectableChannel，用于设置SelectableChannel参数和进行I/O操作。
+3. int readInterestOp：代表了JDK SelectionKey的OP_READ
+4. volatile SelectionKey selectionKey：该SelectionKey是Channel注册到EventLoop后返回的选择键。由于Channel会面临多个业务线程的并发
+写操作，当SelectionKey由SelectionKey修改以后，为了能让其他业务线程感知到变化，所以需要使用volatile保证修改的可见性。
+5. ChannelPromise connectPromise：代表连接操作结果
+6. ScheduledFuture<?> connectTimeoutFuture：连接超时定时器
+7. SocketAddress requestedRemoteAddress：请求的远程通信地址信息
+
+#### 核心源码
+AbstractNioChannel注册源码
+```java
+    @Override
+    protected void doRegister() throws Exception {
+        boolean selected = false;
+        for (;;) {
+            try {
+                selectionKey = javaChannel().register(eventLoop().unwrappedSelector(), 0, this);
+                return;
+            } catch (CancelledKeyException e) {
+                if (!selected) {
+                    // Force the Selector to select now as the "canceled" SelectionKey may still be
+                    // cached and not removed because no Select.select(..) operation was called yet.
+                    eventLoop().selectNow();
+                    selected = true;
+                } else {
+                    // We forced a select operation on the selector before but the SelectionKey is still cached
+                    // for whatever reason. JDK bug ?
+                    throw e;
+                }
+            }
+        }
+    }
+```
+首先定义一个boolean类型的局部变量selected来标识注册操作是否成功，调用SelectableChannel的register方法，将当前的Channel注册到EventLoop
+的多路复用器上，SelectableChannel的注册方法定义如下：
+```java
+public abstract SelectionKey register(Selector sel, int ops, Object att) throws ClosedChannelException;
+```
+注册Channel的时候需要指定监听的网络操作位来表示Channel对哪几类网络事件感兴趣，具体的定义如下：
+1. public static final int OP_READ = 1 << 0： 读操作位
+2. public static final int OP_WRITE = 1 << 2：写操作位
+3. public static final int OP_CONNECT = 1 << 3：客户端连接服务端操作位
+4. public static final int OP_ACCEPT = 1 << 4：服务端接受客户端连接操作位
+
+AbstractNioChannel注册的是0，说明对任何事件不感兴趣，仅仅完成注册操作。注册的时候可以指定附件，后续Channel接收到网络事件通知时可以从
+SelectionKey中重新获取之前的附件进行处理。如果注册Channel成功，则返回SelectionKey，通过SelectionKey可以从多路复用器中获取Channel对象。
+
+如果当前注册返回的SelectionKey已经被取消，则抛出CancelledKeyException异常，捕获该异常进行处理。如果是第一次处理该异常，调用多路复用器的
+selectNow()方法将已经取消的selectionKey从多路复用器中删除掉。操作成功之后，将selected置为true，说明之前失效的selectionKey已经被删除掉。
+继续发起下一次注册操作，如果成功则退出，如果仍然发生CancelledKeyException异常，说明我们无法删除已经被取消的selectionKey，发生这种问题，
+直接抛出CancelledKeyException异常到上层进行统一处理。
+
+下面看一下准备处理读操作之前需要设置网络操作位为读的代码：
+```java
+    @Override
+    protected void doBeginRead() throws Exception {
+        // Channel.read() or ChannelHandlerContext.read() was called
+        final SelectionKey selectionKey = this.selectionKey;
+        if (!selectionKey.isValid()) {
+            return;
+        }
+
+        readPending = true;
+
+        final int interestOps = selectionKey.interestOps();
+        if ((interestOps & readInterestOp) == 0) {
+            selectionKey.interestOps(interestOps | readInterestOp);
+        }
+    }
+```
+获取当前的SelectionKey进行判断，如果可用说明Channel当前状态正常，则可以进行正常的操作位修改。先将等待读设置为true，将SelectionKey当前的
+操作位与读操作位按位于操作，如果等于0，说明目前并没有设置读操作位，通过interestOps | readInterestOp设置读操作位，最后调用selectionKey的
+interestOps方法重新设置通道的网络操作位，这样就可以监听网络的读事件。
