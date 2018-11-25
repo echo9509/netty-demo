@@ -284,3 +284,81 @@ private final Runnable flushTask：负责继续写半包消息
 首先判断消息的类型是否是ByteBuf，如果是进行强制转换，判断ByteBuf是否可读，如果不可读，将该消息从消息循环数组中删除，继续循环处理其他消息。
 如果可读，则由具体的实现子类完成将ByeBuf写入到Channel中，并返回写入的字节数。如果返回的字节数小于等于0，则返回整形的最大数值。如果返回的
 写入字节数大于0，设置该消息的处理的进度，然后再判断该消息是否可读，如果不可读，就把该消息移除，返回1。
+
+最后还有一块处理半包发送任务的代码incompleteWrite，源码如下：
+```java
+    protected final void incompleteWrite(boolean setOpWrite) {
+        // Did not write completely.
+        if (setOpWrite) {
+            setOpWrite();
+        } else {
+            // It is possible that we have set the write OP, woken up by NIO because the socket is writable, and then
+            // use our write quantum. In this case we no longer want to set the write OP because the socket is still
+            // writable (as far as we know). We will find out next time we attempt to write if the socket is writable
+            // and set the write OP if necessary.
+            clearOpWrite();
+
+            // Schedule flush again later so other tasks can be picked up in the meantime
+            eventLoop().execute(flushTask);
+        }
+    }
+```
+首先判断是否需要设置半包标识，如果需要则调用setOpWrite()来设置半包标识。如果没有设置写操作位，需要启动单独的Runnable flushTask，将其加入
+到EventLoop中执行，由Runnable负责半包消息的发送，它就是简单的调用flush方法来发送缓冲数组中的消息。
+
+### AbstractNioMessageChannel
+#### 成员变量定义
+boolean inputShutdown
+
+#### API
+```java
+    @Override
+    protected void doWrite(ChannelOutboundBuffer in) throws Exception {
+        final SelectionKey key = selectionKey();
+        final int interestOps = key.interestOps();
+
+        for (;;) {
+            Object msg = in.current();
+            if (msg == null) {
+                // Wrote all messages.
+                if ((interestOps & SelectionKey.OP_WRITE) != 0) {
+                    key.interestOps(interestOps & ~SelectionKey.OP_WRITE);
+                }
+                break;
+            }
+            try {
+                boolean done = false;
+                for (int i = config().getWriteSpinCount() - 1; i >= 0; i--) {
+                    if (doWriteMessage(msg, in)) {
+                        done = true;
+                        break;
+                    }
+                }
+
+                if (done) {
+                    in.remove();
+                } else {
+                    // Did not write all messages.
+                    if ((interestOps & SelectionKey.OP_WRITE) == 0) {
+                        key.interestOps(interestOps | SelectionKey.OP_WRITE);
+                    }
+                    break;
+                }
+            } catch (Exception e) {
+                if (continueOnWriteError()) {
+                    in.remove(e);
+                } else {
+                    throw e;
+                }
+            }
+        }
+    }
+```
+在循环体中对消息进行发送，首先从ChannelOutboundBuffer中弹出一条消息进行处理，如果消息为空，说明发送缓冲区为空，所有消息都被发送完成。此时
+清除写半包标识，退出循环。
+然后借用writeSpinCount对单条消息进行发送，调用doWriteMessage判断消息是否发送成功，如果成功，则将发送标识done设置为true，退出循环，否则
+继续执行循环，知道执行writeSpinCount次。
+发送完成后，判断发送结果，如果当前的消息被完全发送出去，则将该消息从缓冲数组中删除；否则设置半包标识，注册SelectionKey.OP_WRITE到多路复用
+器上，由多路复用器轮询对应的Channel重新发送尚未发送完全的半包消息。
+
+AbstractNioMessageChannel和AbstractNioByteChannel不同之处是前者发送的是POJO对象，后者发送的是ByteBuf或者FileRegion。
