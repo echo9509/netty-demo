@@ -362,3 +362,100 @@ boolean inputShutdown
 器上，由多路复用器轮询对应的Channel重新发送尚未发送完全的半包消息。
 
 AbstractNioMessageChannel和AbstractNioByteChannel不同之处是前者发送的是POJO对象，后者发送的是ByteBuf或者FileRegion。
+
+### NioServerSocketChannel
+#### 成员变量和静态方法
+![FkzPPJ.png](https://s1.ax1x.com/2018/11/25/FkzPPJ.png)
+1. ChannelMetadata METADATA：Channel元数据信息
+2. ServerSocketChannelConfig config：用于配置ServerSocketChannel的TCP参数
+3. ServerSocketChannel newSocket(SelectorProvider provider)：借助SelectorProvider的openServerSocketChannel方法打开新的ServerSocketChannel
+
+#### API
+```java
+    @Override
+    public boolean isActive() {
+        return javaChannel().socket().isBound();
+    }
+
+    @Override
+    public InetSocketAddress remoteAddress() {
+        return null;
+    }
+
+    @Override
+    protected ServerSocketChannel javaChannel() {
+        return (ServerSocketChannel) super.javaChannel();
+    }
+
+    @Override
+    protected SocketAddress localAddress0() {
+        return SocketUtils.localSocketAddress(javaChannel().socket());
+    }
+
+    @Override
+    protected void doBind(SocketAddress localAddress) throws Exception {
+        if (PlatformDependent.javaVersion() >= 7) {
+            javaChannel().bind(localAddress, config.getBacklog());
+        } else {
+            javaChannel().socket().bind(localAddress, config.getBacklog());
+        }
+    }
+```
+doBind方法一来运行时JAVA的版本，如果大于7就调用ServerSocketChannel的bind方法，否则调用ServerSocket的bind方法。
+```java
+    @Override
+    protected int doReadMessages(List<Object> buf) throws Exception {
+        SocketChannel ch = SocketUtils.accept(javaChannel());
+
+        try {
+            if (ch != null) {
+                buf.add(new NioSocketChannel(this, ch));
+                return 1;
+            }
+        } catch (Throwable t) {
+            logger.warn("Failed to create a new channel from an accepted socket.", t);
+
+            try {
+                ch.close();
+            } catch (Throwable t2) {
+                logger.warn("Failed to close a socket.", t2);
+            }
+        }
+
+        return 0;
+    }
+```
+首先通过SocketUtils.accept来接受新的连接，如果新的连接不为空，则借助ServerSocketChannel和新接受的SocketChannel来创建一个NioSocketChannel，
+并将NioSocketChannel添加到List<Object> buf，然后返回1，表示服务端接受消息成功。
+
+对于NioServerSocketChannel来说，它的读取操作就是接收客户端的连接，创建NioSocketChannel对象。
+
+#### 无关API
+一些方法是与客户端Channel相关的，因此，对于服务端Channel无须实现，如果这些方法被误调，则返回UnsupportedOperationException异常。
+```java
+    @Override
+    protected boolean doConnect(
+            SocketAddress remoteAddress, SocketAddress localAddress) throws Exception {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    protected void doFinishConnect() throws Exception {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    protected SocketAddress remoteAddress0() {
+        return null;
+    }
+
+    @Override
+    protected void doDisconnect() throws Exception {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    protected boolean doWriteMessage(Object msg, ChannelOutboundBuffer in) throws Exception {
+        throw new UnsupportedOperationException();
+    }
+```
