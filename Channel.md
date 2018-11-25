@@ -459,3 +459,108 @@ doBind方法一来运行时JAVA的版本，如果大于7就调用ServerSocketCha
         throw new UnsupportedOperationException();
     }
 ```
+
+### NioSocketChannel
+#### 连接操作
+```java
+    @Override
+    protected boolean doConnect(SocketAddress remoteAddress, SocketAddress localAddress) throws Exception {
+        if (localAddress != null) {
+            doBind0(localAddress);
+        }
+
+        boolean success = false;
+        try {
+            boolean connected = SocketUtils.connect(javaChannel(), remoteAddress);
+            if (!connected) {
+                selectionKey().interestOps(SelectionKey.OP_CONNECT);
+            }
+            success = true;
+            return connected;
+        } finally {
+            if (!success) {
+                doClose();
+            }
+        }
+    }
+```
+首先判断本地Socket地址是否为空，如果不为空，先绑定本地Socket地址。绑定成功之后，SocketUtils.connect通过向远程Socket地址发起TCP连接。
+对连接结果进行判断，连接结果有以下三种可能：
+1. 连接成功，返回true
+2. 暂时没有连接上，服务端没有返回ACK应答，连接结果不确定，返回false
+3. 连接失败，直接抛出I/O异常
+
+如果是结果2，需要将NioSocketChannel的SelectionKey设置为OP_CONNECT，监听连接网络操作位。如果抛出了I/O异常，说明客户端的TCP握手请求直接
+被RESET或者被拒绝，此时需要调用doClose()关闭客户端连接
+```java
+    protected void doClose() throws Exception {
+        super.doClose();
+        javaChannel().close();
+    }
+```
+
+#### 写半包
+```java
+    @Override
+    protected void doWrite(ChannelOutboundBuffer in) throws Exception {
+        SocketChannel ch = javaChannel();
+        int writeSpinCount = config().getWriteSpinCount();
+        do {
+            if (in.isEmpty()) {
+                // All written so clear OP_WRITE
+                clearOpWrite();
+                // Directly return here so incompleteWrite(...) is not called.
+                return;
+            }
+
+            // Ensure the pending writes are made of ByteBufs only.
+            int maxBytesPerGatheringWrite = ((NioSocketChannelConfig) config).getMaxBytesPerGatheringWrite();
+            ByteBuffer[] nioBuffers = in.nioBuffers(1024, maxBytesPerGatheringWrite);
+            int nioBufferCnt = in.nioBufferCount();
+
+            // Always us nioBuffers() to workaround data-corruption.
+            // See https://github.com/netty/netty/issues/2761
+            switch (nioBufferCnt) {
+                case 0:
+                    // We have something else beside ByteBuffers to write so fallback to normal writes.
+                    writeSpinCount -= doWrite0(in);
+                    break;
+                case 1: {
+                    // Only one ByteBuf so use non-gathering write
+                    // Zero length buffers are not added to nioBuffers by ChannelOutboundBuffer, so there is no need
+                    // to check if the total size of all the buffers is non-zero.
+                    ByteBuffer buffer = nioBuffers[0];
+                    int attemptedBytes = buffer.remaining();
+                    final int localWrittenBytes = ch.write(buffer);
+                    if (localWrittenBytes <= 0) {
+                        incompleteWrite(true);
+                        return;
+                    }
+                    adjustMaxBytesPerGatheringWrite(attemptedBytes, localWrittenBytes, maxBytesPerGatheringWrite);
+                    in.removeBytes(localWrittenBytes);
+                    --writeSpinCount;
+                    break;
+                }
+                default: {
+                    // Zero length buffers are not added to nioBuffers by ChannelOutboundBuffer, so there is no need
+                    // to check if the total size of all the buffers is non-zero.
+                    // We limit the max amount to int above so cast is safe
+                    long attemptedBytes = in.nioBufferSize();
+                    final long localWrittenBytes = ch.write(nioBuffers, 0, nioBufferCnt);
+                    if (localWrittenBytes <= 0) {
+                        incompleteWrite(true);
+                        return;
+                    }
+                    // Casting to int is safe because we limit the total amount of data in the nioBuffers to int above.
+                    adjustMaxBytesPerGatheringWrite((int) attemptedBytes, (int) localWrittenBytes,
+                            maxBytesPerGatheringWrite);
+                    in.removeBytes(localWrittenBytes);
+                    --writeSpinCount;
+                    break;
+                }
+            }
+        } while (writeSpinCount > 0);
+
+        incompleteWrite(writeSpinCount < 0);
+    }
+```
