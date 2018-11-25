@@ -195,3 +195,92 @@ selectNow()方法将已经取消的selectionKey从多路复用器中删除掉。
 获取当前的SelectionKey进行判断，如果可用说明Channel当前状态正常，则可以进行正常的操作位修改。先将等待读设置为true，将SelectionKey当前的
 操作位与读操作位按位于操作，如果等于0，说明目前并没有设置读操作位，通过interestOps | readInterestOp设置读操作位，最后调用selectionKey的
 interestOps方法重新设置通道的网络操作位，这样就可以监听网络的读事件。
+
+### AbstractNioByteChannel
+#### 成员变量定义
+private final Runnable flushTask：负责继续写半包消息
+
+#### API
+看下doWrite(ChannelOutboundBuffer in)的源码：
+```java
+    @Override
+    protected void doWrite(ChannelOutboundBuffer in) throws Exception {
+        int writeSpinCount = config().getWriteSpinCount();
+        do {
+            Object msg = in.current();
+            if (msg == null) {
+                // Wrote all messages.
+                clearOpWrite();
+                // Directly return here so incompleteWrite(...) is not called.
+                return;
+            }
+            writeSpinCount -= doWriteInternal(in, msg);
+        } while (writeSpinCount > 0);
+
+        incompleteWrite(writeSpinCount < 0);
+    }
+```
+首先从消息发送环形数组中弹出一个消息，判断该消息是否为空，如果为空，说明所有的消息都已经发送完成，清除半包标识，退出循环（该循环的次数默认最
+多16次），设置半包消息有最大处理次数的原因是当循环发送的时候，I/O线程会一直进行写操作，此时I/O线程无法处理其他的I/O操作，例如读新的消息或
+执行定时任务和NioTask等，如果网络I/O阻塞或者对方接受消息太慢，可能会导致线程假死。看一下清除半包标识clearOpWrite()的逻辑代码：
+```java
+    protected final void clearOpWrite() {
+        final SelectionKey key = selectionKey();
+        // Check first if the key is still valid as it may be canceled as part of the deregistration
+        // from the EventLoop
+        // See https://github.com/netty/netty/issues/2104
+        if (!key.isValid()) {
+            return;
+        }
+        final int interestOps = key.interestOps();
+        if ((interestOps & SelectionKey.OP_WRITE) != 0) {
+            key.interestOps(interestOps & ~SelectionKey.OP_WRITE);
+        }
+    }
+```
+首先获取当前的SelectionKey，如果当前的SelectionKey已被取消或者无效，直接返回。如果有效，则获取当前的监控的网络操作位，判断当前的网络操作
+位是否监听写事件，如果正在监听，则取消对写事件的监听。
+
+如果发送的消息不为空，则继续对消息进行处理，源码如下：
+```java
+    private int doWriteInternal(ChannelOutboundBuffer in, Object msg) throws Exception {
+        if (msg instanceof ByteBuf) {
+            ByteBuf buf = (ByteBuf) msg;
+            if (!buf.isReadable()) {
+                in.remove();
+                return 0;
+            }
+
+            final int localFlushedAmount = doWriteBytes(buf);
+            if (localFlushedAmount > 0) {
+                in.progress(localFlushedAmount);
+                if (!buf.isReadable()) {
+                    in.remove();
+                }
+                return 1;
+            }
+        } else if (msg instanceof FileRegion) {
+            FileRegion region = (FileRegion) msg;
+            if (region.transferred() >= region.count()) {
+                in.remove();
+                return 0;
+            }
+
+            long localFlushedAmount = doWriteFileRegion(region);
+            if (localFlushedAmount > 0) {
+                in.progress(localFlushedAmount);
+                if (region.transferred() >= region.count()) {
+                    in.remove();
+                }
+                return 1;
+            }
+        } else {
+            // Should not reach here.
+            throw new Error();
+        }
+        return WRITE_STATUS_SNDBUF_FULL;
+    }
+```
+首先判断消息的类型是否是ByteBuf，如果是进行强制转换，判断ByteBuf是否可读，如果不可读，将该消息从消息循环数组中删除，继续循环处理其他消息。
+如果可读，则由具体的实现子类完成将ByeBuf写入到Channel中，并返回写入的字节数。如果返回的字节数小于等于0，则返回整形的最大数值。如果返回的
+写入字节数大于0，设置该消息的处理的进度，然后再判断该消息是否可读，如果不可读，就把该消息移除，返回1。
