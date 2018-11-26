@@ -564,3 +564,18 @@ doBind方法一来运行时JAVA的版本，如果大于7就调用ServerSocketCha
         incompleteWrite(writeSpinCount < 0);
     }
 ```
+首先判断ChannelOutboundBuffer消息环形数组中是否有待发送的消息，如果没有，直接清除写操作位然后返回。从消息环形数组中获取可发送的ByteBuffer
+数组以及可发送的数量，如果消息只有一个，直接取第一个消息，将消息写入Channel，如果写入的字节数小于等于0，设置网络监听位为写操作位，然后后返回。
+如果消息的数量大于大于1，就先取出可发送数组的总字节数。
+
+#### 读写操作
+```java
+    @Override
+    protected int doReadBytes(ByteBuf byteBuf) throws Exception {
+        final RecvByteBufAllocator.Handle allocHandle = unsafe().recvBufAllocHandle();
+        allocHandle.attemptedBytesRead(byteBuf.writableBytes());
+        return byteBuf.writeBytes(javaChannel(), allocHandle.attemptedBytesRead());
+    }
+```
+首先通过RecvByteBufAllocator.Handle设置从NioSocketChannel读取的字节数为ByteBuf可写的字节数，然后调用ByteBuf的writeBytes从Channel
+中读取指定长度的字节。
