@@ -741,3 +741,88 @@ AbstractNioChannel的doRegister()不再分析，详情见上面。
 ```
 首先也是判断当前Channel是否打开，如果没有打开直接退出，确认Channel打开之后，直接调用doBind方法进行绑定。doBind方法对于服务端(NioServerSocketChannel)
 和客户端(NioSocketChannel)有不同的实现，关于NioServerSocketChannel和NioSocketChannel的doBind实现在前面已经分析过。
+
+#### disconnect
+disconnect用于客户端或者服务端主动关闭连接。
+
+#### close
+```java
+        private void close(final ChannelPromise promise, final Throwable cause,
+                           final ClosedChannelException closeCause, final boolean notify) {
+            if (!promise.setUncancellable()) {
+                return;
+            }
+
+            if (closeInitiated) {
+                if (closeFuture.isDone()) {
+                    // Closed already.
+                    safeSetSuccess(promise);
+                } else if (!(promise instanceof VoidChannelPromise)) { // Only needed if no VoidChannelPromise.
+                    // This means close() was called before so we just register a listener and return
+                    closeFuture.addListener(new ChannelFutureListener() {
+                        @Override
+                        public void operationComplete(ChannelFuture future) throws Exception {
+                            promise.setSuccess();
+                        }
+                    });
+                }
+                return;
+            }
+
+            closeInitiated = true;
+
+            final boolean wasActive = isActive();
+            final ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
+            this.outboundBuffer = null; // Disallow adding any messages and flushes to outboundBuffer.
+            Executor closeExecutor = prepareToClose();
+            if (closeExecutor != null) {
+                closeExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            // Execute the close.
+                            doClose0(promise);
+                        } finally {
+                            // Call invokeLater so closeAndDeregister is executed in the EventLoop again!
+                            invokeLater(new Runnable() {
+                                @Override
+                                public void run() {
+                                    if (outboundBuffer != null) {
+                                        // Fail all the queued messages
+                                        outboundBuffer.failFlushed(cause, notify);
+                                        outboundBuffer.close(closeCause);
+                                    }
+                                    fireChannelInactiveAndDeregister(wasActive);
+                                }
+                            });
+                        }
+                    }
+                });
+            } else {
+                try {
+                    // Close the channel and fail the queued messages in all cases.
+                    doClose0(promise);
+                } finally {
+                    if (outboundBuffer != null) {
+                        // Fail all the queued messages.
+                        outboundBuffer.failFlushed(cause, notify);
+                        outboundBuffer.close(closeCause);
+                    }
+                }
+                if (inFlush0) {
+                    invokeLater(new Runnable() {
+                        @Override
+                        public void run() {
+                            fireChannelInactiveAndDeregister(wasActive);
+                        }
+                    });
+                } else {
+                    fireChannelInactiveAndDeregister(wasActive);
+                }
+            }
+        }
+```
+当第一次关闭Channel时，直接将closeInitiated设置为true，接着获取该Channel是否是激活状态和消息循环数组存储到临时变量，然后将消息循环数组置为null，
+不允许消息的写入，然后获取一个执行器，NioSocketChannel中获取的是GlobalEventExecutor执行器，然后封装一个Runnable的Task交给这个执行器取执行，
+该执行器回去关闭Channel，最后封装一个Task交给EventLoop去执行，该Task的主要任务是如果过循环消息数组不为NULL则去失效所有的消息，然后最后失活Channel
+连接和取消注册。
