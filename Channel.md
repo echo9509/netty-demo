@@ -599,3 +599,145 @@ write(Object msg, ChannelPromise promise) | void | 发送消息，操作完成�
 flush() | void | 将消息缓冲数组中的消息写入Channel
 voidPromise() | ChannelPromise | 返回一个特殊的可重用和传递的ChannelPromise，它不用于操作成功或失败的通知器，仅仅作为一个容器被使用
 outboundBuffer() | ChanneOutboundBuffer | 返回消息发送缓冲区
+
+## Unsafe源码
+### AbstractUnsafe
+#### register方法
+该方法主要用于将当前Unsafe对应的Channel注册到EventLoop的多路复用器上，然后调用DefaultChannelPipeline的fireChannelRegistered()方法。
+如果Channel被激活并且是第一次被注册，则调用DefaultChannelPipeline的fireChannelActive()方法。
+```java
+        @Override
+        public final void register(EventLoop eventLoop, final ChannelPromise promise) {
+            if (eventLoop == null) {
+                throw new NullPointerException("eventLoop");
+            }
+            if (isRegistered()) {
+                promise.setFailure(new IllegalStateException("registered to an event loop already"));
+                return;
+            }
+            if (!isCompatible(eventLoop)) {
+                promise.setFailure(
+                        new IllegalStateException("incompatible event loop type: " + eventLoop.getClass().getName()));
+                return;
+            }
+
+            AbstractChannel.this.eventLoop = eventLoop;
+
+            if (eventLoop.inEventLoop()) {
+                register0(promise);
+            } else {
+                try {
+                    eventLoop.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            register0(promise);
+                        }
+                    });
+                } catch (Throwable t) {
+                    logger.warn(
+                            "Force-closing a channel whose registration task was not accepted by an event loop: {}",
+                            AbstractChannel.this, t);
+                    closeForcibly();
+                    closeFuture.setClosed();
+                    safeSetFailure(promise, t);
+                }
+            }
+        }
+```
+首先判断EventLoop是否为空，如果为空，抛出NullPointerException异常；接着判断Channel是否被注册，如果已经注册通知ChannelFuture注册失败；
+接着判断EventLoop是否和当前Channel兼容，如果不兼容通知ChannelFuture注册失败。上述校验通过之后，会设置当前Channel的EventLoop为参数中的
+EventLoop。判断当前所在的线程是否是Channel对应的EventLoop线程，如果是同一个线程则不存在多线程并发操作问题，直接调用register0方法进行注册；
+如果是由用户线程或者其他线程发起的注册操作，则将注册操作封装成Runnable，放到EventLoop任务队列中执行。此处不直接执行register0放的原因是
+**避免多线程操作Channel的问题**。
+```java
+        private void register0(ChannelPromise promise) {
+            try {
+                // check if the channel is still open as it could be closed in the mean time when the register
+                // call was outside of the eventLoop
+                if (!promise.setUncancellable() || !ensureOpen(promise)) {
+                    return;
+                }
+                boolean firstRegistration = neverRegistered;
+                doRegister();
+                neverRegistered = false;
+                registered = true;
+
+                // Ensure we call handlerAdded(...) before we actually notify the promise. This is needed as the
+                // user may already fire events through the pipeline in the ChannelFutureListener.
+                pipeline.invokeHandlerAddedIfNeeded();
+
+                safeSetSuccess(promise);
+                pipeline.fireChannelRegistered();
+                // Only fire a channelActive if the channel has never been registered. This prevents firing
+                // multiple channel actives if the channel is deregistered and re-registered.
+                if (isActive()) {
+                    if (firstRegistration) {
+                        pipeline.fireChannelActive();
+                    } else if (config().isAutoRead()) {
+                        // This channel was registered before and autoRead() is set. This means we need to begin read
+                        // again so that we process inbound data.
+                        //
+                        // See https://github.com/netty/netty/issues/4805
+                        beginRead();
+                    }
+                }
+            } catch (Throwable t) {
+                // Close the channel directly to avoid FD leak.
+                closeForcibly();
+                closeFuture.setClosed();
+                safeSetFailure(promise, t);
+            }
+        }
+```
+首先调用ensureOpen方法确认当前Channel是否打开，如果没有打开则无法进行注册，直接返回。否则调用doRegister方法进行注册，它由AbstractNioUnsafe
+对应的AbstractNioChannel来实现。
+
+AbstractNioChannel的doRegister()不再分析，详情见上面。
+
+#### bind
+该方法主要用于绑定指定的端口，对于服务端，用于绑定监听端口，可以设置backlog参数；对于客户端而言，主要用来指定客户端Channel的本地绑定Socket地址。
+```java
+        @Override
+        public final void bind(final SocketAddress localAddress, final ChannelPromise promise) {
+            assertEventLoop();
+
+            if (!promise.setUncancellable() || !ensureOpen(promise)) {
+                return;
+            }
+
+            // See: https://github.com/netty/netty/issues/576
+            if (Boolean.TRUE.equals(config().getOption(ChannelOption.SO_BROADCAST)) &&
+                localAddress instanceof InetSocketAddress &&
+                !((InetSocketAddress) localAddress).getAddress().isAnyLocalAddress() &&
+                !PlatformDependent.isWindows() && !PlatformDependent.maybeSuperUser()) {
+                // Warn a user about the fact that a non-root user can't receive a
+                // broadcast packet on *nix if the socket is bound on non-wildcard address.
+                logger.warn(
+                        "A non-root user can't receive a broadcast packet if the socket " +
+                        "is not bound to a wildcard address; binding to a non-wildcard " +
+                        "address (" + localAddress + ") anyway as requested.");
+            }
+
+            boolean wasActive = isActive();
+            try {
+                doBind(localAddress);
+            } catch (Throwable t) {
+                safeSetFailure(promise, t);
+                closeIfClosed();
+                return;
+            }
+
+            if (!wasActive && isActive()) {
+                invokeLater(new Runnable() {
+                    @Override
+                    public void run() {
+                        pipeline.fireChannelActive();
+                    }
+                });
+            }
+
+            safeSetSuccess(promise);
+        }
+```
+首先也是判断当前Channel是否打开，如果没有打开直接退出，确认Channel打开之后，直接调用doBind方法进行绑定。doBind方法对于服务端(NioServerSocketChannel)
+和客户端(NioSocketChannel)有不同的实现，关于NioServerSocketChannel和NioSocketChannel的doBind实现在前面已经分析过。
