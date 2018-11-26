@@ -579,3 +579,23 @@ doBind方法一来运行时JAVA的版本，如果大于7就调用ServerSocketCha
 ```
 首先通过RecvByteBufAllocator.Handle设置从NioSocketChannel读取的字节数为ByteBuf可写的字节数，然后调用ByteBuf的writeBytes从Channel
 中读取指定长度的字节。
+
+# Unsafe
+Unsafe接口是Channel接口的辅助接口，它不应该被用户直接调用，实际的I/O读写操作都是由Unsafe接口负责完成。
+方法名 | 返回值 | 功能说明
+--- | --- | ---
+recvBufAllocHandle() | RecvByteBufAllocator.Handle | 返回用于ByteBuf内存分配的分配器
+localAddress() | SocketAddress | 返回本地绑定的Socket地址
+remoteAddress() | SocketAddress | 返回通信端的Socket地址
+register(EventLoop eventLoop, ChannelPromise promise) | void | 将Channel注册到多路复用器上，操作完成之后，通知ChannelFuture
+bind(SocketAddress localAddress, ChannelPromise promise) | void | 绑定本地地址SocketAddress到Channel，操作完成之后，通知ChannelFuture
+connect(SocketAddress remoteAddress, SocketAddress localAddress, ChannelPromise promise) | void | 绑定本地Socket地址后，连接服务端，操作完成通知ChannelFuture
+disconnect(ChannelPromise promise) | void | 断开Channel的连接，操作完成通知ChannelFuture
+close(ChannelPromise promise) | void | 关闭Channel的连接，操作完成通知ChannelFuture
+closeForcibly() | void | 强制关闭Channel的连接
+deregister(ChannelPromise promise) | void | 从多路复用器上取消Channel的注册，操作完成通知ChannelFuture
+beginRead() | void | 设置网络操作位为读用于读取消息
+write(Object msg, ChannelPromise promise) | void | 发送消息，操作完成之后通知ChannelFuture
+flush() | void | 将消息缓冲数组中的消息写入Channel
+voidPromise() | ChannelPromise | 返回一个特殊的可重用和传递的ChannelPromise，它不用于操作成功或失败的通知器，仅仅作为一个容器被使用
+outboundBuffer() | ChanneOutboundBuffer | 返回消息发送缓冲区
