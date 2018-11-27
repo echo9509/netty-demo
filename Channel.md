@@ -939,3 +939,68 @@ disconnect用于客户端或者服务端主动关闭连接。
 首先调用ChannelOutboundBuffer的addFlush()设置发送消息缓冲区的范围，然后后调用flush0()方法进行发送。flush0()方法首先判断Channel是否失活，
 如果失活，则通知ChannelFuture发送失败。否则调用doWrite方法进行具体的发送，该方法由具体的实现子类实现，关于NioSocketChannel的doWrite方法
 在前面已经介绍过，这里不再重复。
+
+### AbstractNioUnsafe
+AbstractNioUnsafe继承AbstractUnSafe，主要实现了connect、finishConnect方法。
+#### connect
+```java
+        @Override
+        public final void connect(
+                final SocketAddress remoteAddress, final SocketAddress localAddress, final ChannelPromise promise) {
+            if (!promise.setUncancellable() || !ensureOpen(promise)) {
+                return;
+            }
+
+            try {
+                if (connectPromise != null) {
+                    // Already a connect in process.
+                    throw new ConnectionPendingException();
+                }
+
+                boolean wasActive = isActive();
+                if (doConnect(remoteAddress, localAddress)) {
+                    fulfillConnectPromise(promise, wasActive);
+                } else {
+                    connectPromise = promise;
+                    requestedRemoteAddress = remoteAddress;
+
+                    // Schedule connect timeout.
+                    int connectTimeoutMillis = config().getConnectTimeoutMillis();
+                    if (connectTimeoutMillis > 0) {
+                        connectTimeoutFuture = eventLoop().schedule(new Runnable() {
+                            @Override
+                            public void run() {
+                                ChannelPromise connectPromise = AbstractNioChannel.this.connectPromise;
+                                ConnectTimeoutException cause =
+                                        new ConnectTimeoutException("connection timed out: " + remoteAddress);
+                                if (connectPromise != null && connectPromise.tryFailure(cause)) {
+                                    close(voidPromise());
+                                }
+                            }
+                        }, connectTimeoutMillis, TimeUnit.MILLISECONDS);
+                    }
+
+                    promise.addListener(new ChannelFutureListener() {
+                        @Override
+                        public void operationComplete(ChannelFuture future) throws Exception {
+                            if (future.isCancelled()) {
+                                if (connectTimeoutFuture != null) {
+                                    connectTimeoutFuture.cancel(false);
+                                }
+                                connectPromise = null;
+                                close(voidPromise());
+                            }
+                        }
+                    });
+                }
+            } catch (Throwable t) {
+                promise.tryFailure(annotateConnectException(t, remoteAddress));
+                closeIfClosed();
+            }
+        }
+```
+首先判断connectPromise是否为空，不为空，说明该Channel正在连接远程端点，此时抛出ConnectionPendingException异常，否则执行doConnect方法
+进行真正的远程连接，该方法由具体的实现子类来执行，NioSocketChannel的doConnect方法在前文已经讲解过。如果返回true说明连接成功，则去触发
+ChannelActive事件，如果返回false说明还没有成功建立连接可能还没收到应答，此时需要获取连接超时的事件，然后封装一个Runnable的Task，该Task会在
+连接超时之后触发，通知ChannelFuture连接失败并发起取消注册操作，接着为ChannelPromise添加一个监听器，当连接完成之后会受到通知，如果连接操作被取消，
+会取消超时任务的执行，并且发起取消注册操作。
