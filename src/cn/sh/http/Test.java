@@ -2,6 +2,7 @@ package cn.sh.http;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.CharsetUtil;
 
 import java.io.UnsupportedEncodingException;

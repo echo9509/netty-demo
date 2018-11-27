@@ -52,11 +52,6 @@ public class EchoClient {
     }
 
     public static void main(String[] args) throws InterruptedException {
-        if (args.length != 2) {
-            System.err.println("参数个数不正确");
-            return;
-        }
-        int port = Integer.parseInt(args[1]);
-        new EchoClient(args[0], port).start();
+        new EchoClient("localhost", 8080).start();
     }
 }

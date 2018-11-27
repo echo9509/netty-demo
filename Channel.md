@@ -1034,3 +1034,164 @@ ChannelActive事件，如果返回false说明还没有成功建立连接可能�
 首先会缓存连接状态，紧接着调用具体子类的doFinishConnect方法对连接结果进行判断，只要连接失败(连接失败或发生链路被关闭、链路终端等异常)
 doFinishConnect就会抛出Error，异常抛出之后，会关闭句柄释放资源，如果成功则调用fulfillConnectPromise方法，该方法的主要作用是将Channel的
 监听位修改为读操作位。最后会将超时定时任务取消。
+
+### NioByteUnsafe
+#### read
+```java
+        @Override
+        public final void read() {
+            final ChannelConfig config = config();
+            if (shouldBreakReadReady(config)) {
+                clearReadPending();
+                return;
+            }
+            final ChannelPipeline pipeline = pipeline();
+            final ByteBufAllocator allocator = config.getAllocator();
+            final RecvByteBufAllocator.Handle allocHandle = recvBufAllocHandle();
+            allocHandle.reset(config);
+
+            ByteBuf byteBuf = null;
+            boolean close = false;
+            try {
+                do {
+                    byteBuf = allocHandle.allocate(allocator);
+                    allocHandle.lastBytesRead(doReadBytes(byteBuf));
+                    if (allocHandle.lastBytesRead() <= 0) {
+                        // nothing was read. release the buffer.
+                        byteBuf.release();
+                        byteBuf = null;
+                        close = allocHandle.lastBytesRead() < 0;
+                        if (close) {
+                            // There is nothing left to read as we received an EOF.
+                            readPending = false;
+                        }
+                        break;
+                    }
+
+                    allocHandle.incMessagesRead(1);
+                    readPending = false;
+                    pipeline.fireChannelRead(byteBuf);
+                    byteBuf = null;
+                } while (allocHandle.continueReading());
+
+                allocHandle.readComplete();
+                pipeline.fireChannelReadComplete();
+
+                if (close) {
+                    closeOnRead(pipeline);
+                }
+            } catch (Throwable t) {
+                handleReadException(pipeline, byteBuf, t, close, allocHandle);
+            } finally {
+                // Check if there is a readPending which was not processed yet.
+                // This could be for two reasons:
+                // * The user called Channel.read() or ChannelHandlerContext.read() in channelRead(...) method
+                // * The user called Channel.read() or ChannelHandlerContext.read() in channelReadComplete(...) method
+                //
+                // See https://github.com/netty/netty/issues/2254
+                if (!readPending && !config.isAutoRead()) {
+                    removeReadOp();
+                }
+            }
+        }
+    }
+```
+1. 首先获取NioSocketChannel的SocketChannelConfig，主要用来设置客户端连接的TCP参数。紧接着对allocHandle进行初始化。如果是首次调用，
+将从SocketChannelConfig的RecvByteBufAllocator创建Handler。RecvByteBufAllocator的实现主要有两种，分别是AdaptiveRecvByteBufAllocator
+和FixedRecvByteBufAllocator。
+2. 接着通过接收缓冲区分配器RecvByteBufAllocator.Handle计算获得下次预分配的缓冲区容量，然后根据缓冲区容量进行缓冲区分配
+3. 缓冲区分配完成之后，调用doReadBytes从Channel中进行消息的异步读取
+4. 读取完成后，判断读取的字节数，如果读取的字节数小于等于0，表示没有就绪的消息可读或者发生了I/O异常，此时需要释放缓冲区，接着判断如果读取的字节数
+小于0，需要将readPending = false并退出循环
+5. 每一次读取消息，都会触发ChannelRead事件
+6. 最后判断是否可以继续读取，如果不能则退出循环，触发ChannelReadComplete事件。
+
+### AdaptiveRecvByteBufAllocator
+AdaptiveRecvByteBufAllocator指的是缓冲区可以动态调整的分配器。
+```java
+    static final int DEFAULT_MINIMUM = 64;
+    static final int DEFAULT_INITIAL = 1024;
+    static final int DEFAULT_MAXIMUM = 65536;
+
+    private static final int INDEX_INCREMENT = 4;
+    private static final int INDEX_DECREMENT = 1;
+
+    private static final int[] SIZE_TABLE;
+```
+1. 定义了系统的三个默认值，最小缓冲区的长度64，初始容量1024个字节，最大容量65535字节。
+2. 定义了两个动态调整容量时的步进参数：扩张的步进索引为4，收缩的步进索引为1。
+3. 定义了长度的向量表SIZE_TABLE
+
+向量数组每个值对应一个Buffer容量，当容量小于512字节时，由于缓冲区已经比较小，需要降低步进值；当容量大于512时，说明需要解码的信息码流比较大，
+这时采用调大步进幅度的方式减少动态扩张的频率，采用翻倍的方式进行扩张。
+
+#### AdaptiveRecvByteBufAllocator.getSizeTableIndex
+```java
+    private static int getSizeTableIndex(final int size) {
+        for (int low = 0, high = SIZE_TABLE.length - 1;;) {
+            if (high < low) {
+                return low;
+            }
+            if (high == low) {
+                return high;
+            }
+
+            int mid = low + high >>> 1;
+            int a = SIZE_TABLE[mid];
+            int b = SIZE_TABLE[mid + 1];
+            if (size > b) {
+                low = mid + 1;
+            } else if (size < a) {
+                high = mid - 1;
+            } else if (size == a) {
+                return mid;
+            } else {
+                return mid + 1;
+            }
+        }
+    }
+```
+该方法的主要作用是通过二分查找法根据容量size查找容量向量表的的对应索引。
+
+### AdaptiveRecvByteBufAllocator.HandlerImpl
+HandlerImpl是AdaptiveRecvByteBufAllocator的静态内部类。
+
+使用动态缓冲区分配器的优点:
+1. Netty是一个I/O框架，不同的应用场景，传输的码流大小千差万别。因此Netty根据上次实际读取的码流大小对下次的接受Buffer缓冲区进行预测和调整，
+能够最大限度的满足各种场景
+2. 性能更高，容量过大会导致内存占用开销增加，后续的Buffer处理性能下降；容量过小时需要频繁的内存扩张来接受大的请求消息，同样会导致性能下降。
+3. 节约内存，避免一直进行大内存分配。
+
+#### 成员变量
+```java
+        private final int minIndex;
+        private final int maxIndex;
+        private int index;
+        private int nextReceiveBufferSize;
+        private boolean decreaseNow;
+```
+主要有5个成员变量，分别是对应向量表中的最小索引、最大索引、当前索引、下一次预分配的Buffer大小和是否立即执行容量收缩操作。
+#### record
+当NioSocketChannel执行完读操作后，会计算获得本次轮询读取的总字节数，它就是参数actualReadBytes，执行record方法，根据实际读取的字节数对
+ByteBuf进行动态伸缩和扩张。
+```java
+        private void record(int actualReadBytes) {
+            if (actualReadBytes <= SIZE_TABLE[max(0, index - INDEX_DECREMENT - 1)]) {
+                if (decreaseNow) {
+                    index = max(index - INDEX_DECREMENT, minIndex);
+                    nextReceiveBufferSize = SIZE_TABLE[index];
+                    decreaseNow = false;
+                } else {
+                    decreaseNow = true;
+                }
+            } else if (actualReadBytes >= nextReceiveBufferSize) {
+                index = min(index + INDEX_INCREMENT, maxIndex);
+                nextReceiveBufferSize = SIZE_TABLE[index];
+                decreaseNow = false;
+            }
+        }
+```
+首先，对当前索引做步进缩减，然后获取收缩后索引对应的容量，与实际读取的字节数进行对比，如果发现小于收缩后的容量，则重新对当前索引进行赋值，取
+收缩后的索引和最小索引中的较大者作为最新的索引。然后后，为下一次缓冲区容量分配赋值。相反，如果当前实际读取的字节总数大于之前预分配的初始容量，
+则说明实际分配的容量不足，需要动态扩张。重新计算索引，选取当前索引+扩张步进和最大索引中的较小值作为当前索引，然后后对下一次缓冲区容量分配赋值，
+完成缓冲区容量的动态扩张。

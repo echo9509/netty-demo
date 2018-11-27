@@ -51,14 +51,8 @@ public class EchoServer {
         }
     }
 
-    public static void main(String[] args) throws InterruptedException {
-        if (args.length != 1) {
-            System.err.println("参数类型或者个数不正确");
-            return;
-        }
-        //设置端口值
-        int port = Integer.parseInt(args[0]);
+    public static void main(String[] args) throws InterruptedException { ;
         //启动Echo服务器
-        new EchoServer(port).startServer();
+        new EchoServer(8080).startServer();
     }
 }
