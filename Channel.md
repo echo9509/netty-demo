@@ -865,3 +865,77 @@ disconnect用于客户端或者服务端主动关闭连接。
 首先判断是否在Channel对应的I/O线程上进行操作，校验通过之后，获取环形发送数组，如果该数组为空，通知ChannelFuture操作失败。并且释放msg消息
 的内存。然后根据具体的实现类进行消息类型的转换，然后获取消息的字节长度，如果是FileRegion，则返回0，最后把消息添加到环形数组中，操作完成之后
 通知ChannelFuture。
+
+#### flush
+该方法负责将发送缓冲区中待发送的消息全部写入Channel中，并发送给通信对方。
+```java
+        @Override
+        public final void flush() {
+            assertEventLoop();
+
+            ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
+            if (outboundBuffer == null) {
+                return;
+            }
+
+            outboundBuffer.addFlush();
+            flush0();
+        }
+
+        @SuppressWarnings("deprecation")
+        protected void flush0() {
+            if (inFlush0) {
+                // Avoid re-entrance
+                return;
+            }
+
+            final ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
+            if (outboundBuffer == null || outboundBuffer.isEmpty()) {
+                return;
+            }
+
+            inFlush0 = true;
+
+            // Mark all pending write requests as failure if the channel is inactive.
+            if (!isActive()) {
+                try {
+                    if (isOpen()) {
+                        outboundBuffer.failFlushed(FLUSH0_NOT_YET_CONNECTED_EXCEPTION, true);
+                    } else {
+                        // Do not trigger channelWritabilityChanged because the channel is closed already.
+                        outboundBuffer.failFlushed(FLUSH0_CLOSED_CHANNEL_EXCEPTION, false);
+                    }
+                } finally {
+                    inFlush0 = false;
+                }
+                return;
+            }
+
+            try {
+                doWrite(outboundBuffer);
+            } catch (Throwable t) {
+                if (t instanceof IOException && config().isAutoClose()) {
+                    /**
+                     * Just call {@link #close(ChannelPromise, Throwable, boolean)} here which will take care of
+                     * failing all flushed messages and also ensure the actual close of the underlying transport
+                     * will happen before the promises are notified.
+                     *
+                     * This is needed as otherwise {@link #isActive()} , {@link #isOpen()} and {@link #isWritable()}
+                     * may still return {@code true} even if the channel should be closed as result of the exception.
+                     */
+                    close(voidPromise(), t, FLUSH0_CLOSED_CHANNEL_EXCEPTION, false);
+                } else {
+                    try {
+                        shutdownOutput(voidPromise(), t);
+                    } catch (Throwable t2) {
+                        close(voidPromise(), t2, FLUSH0_CLOSED_CHANNEL_EXCEPTION, false);
+                    }
+                }
+            } finally {
+                inFlush0 = false;
+            }
+        }
+```
+首先调用ChannelOutboundBuffer的addFlush()设置发送消息缓冲区的范围，然后后调用flush0()方法进行发送。flush0()方法首先判断Channel是否失活，
+如果失活，则通知ChannelFuture发送失败。否则调用doWrite方法进行具体的发送，该方法由具体的实现子类实现，关于NioSocketChannel的doWrite方法
+在前面已经介绍过，这里不再重复。
