@@ -826,3 +826,42 @@ disconnect用于客户端或者服务端主动关闭连接。
 不允许消息的写入，然后获取一个执行器，NioSocketChannel中获取的是GlobalEventExecutor执行器，然后封装一个Runnable的Task交给这个执行器取执行，
 该执行器回去关闭Channel，最后封装一个Task交给EventLoop去执行，该Task的主要任务是如果过循环消息数组不为NULL则去失效所有的消息，然后最后失活Channel
 连接和取消注册。
+
+#### write
+该方法实际上将消息添加到环形发送数组中，并不是真正的写Channel。
+```java
+        @Override
+        public final void write(Object msg, ChannelPromise promise) {
+            assertEventLoop();
+
+            ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
+            if (outboundBuffer == null) {
+                // If the outboundBuffer is null we know the channel was closed and so
+                // need to fail the future right away. If it is not null the handling of the rest
+                // will be done in flush0()
+                // See https://github.com/netty/netty/issues/2362
+                safeSetFailure(promise, WRITE_CLOSED_CHANNEL_EXCEPTION);
+                // release message now to prevent resource-leak
+                ReferenceCountUtil.release(msg);
+                return;
+            }
+
+            int size;
+            try {
+                msg = filterOutboundMessage(msg);
+                size = pipeline.estimatorHandle().size(msg);
+                if (size < 0) {
+                    size = 0;
+                }
+            } catch (Throwable t) {
+                safeSetFailure(promise, t);
+                ReferenceCountUtil.release(msg);
+                return;
+            }
+
+            outboundBuffer.addMessage(msg, size, promise);
+        }
+```
+首先判断是否在Channel对应的I/O线程上进行操作，校验通过之后，获取环形发送数组，如果该数组为空，通知ChannelFuture操作失败。并且释放msg消息
+的内存。然后根据具体的实现类进行消息类型的转换，然后获取消息的字节长度，如果是FileRegion，则返回0，最后把消息添加到环形数组中，操作完成之后
+通知ChannelFuture。
