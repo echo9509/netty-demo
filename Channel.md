@@ -1004,3 +1004,33 @@ AbstractNioUnsafe继承AbstractUnSafe，主要实现了connect、finishConnect�
 ChannelActive事件，如果返回false说明还没有成功建立连接可能还没收到应答，此时需要获取连接超时的事件，然后封装一个Runnable的Task，该Task会在
 连接超时之后触发，通知ChannelFuture连接失败并发起取消注册操作，接着为ChannelPromise添加一个监听器，当连接完成之后会受到通知，如果连接操作被取消，
 会取消超时任务的执行，并且发起取消注册操作。
+
+#### finnishConnect
+该方法会在接受到服务端TCP的握手应答消息时调用。
+```java
+        @Override
+        public final void finishConnect() {
+            // Note this method is invoked by the event loop only if the connection attempt was
+            // neither cancelled nor timed out.
+
+            assert eventLoop().inEventLoop();
+
+            try {
+                boolean wasActive = isActive();
+                doFinishConnect();
+                fulfillConnectPromise(connectPromise, wasActive);
+            } catch (Throwable t) {
+                fulfillConnectPromise(connectPromise, annotateConnectException(t, requestedRemoteAddress));
+            } finally {
+                // Check for null as the connectTimeoutFuture is only created if a connectTimeoutMillis > 0 is used
+                // See https://github.com/netty/netty/issues/1770
+                if (connectTimeoutFuture != null) {
+                    connectTimeoutFuture.cancel(false);
+                }
+                connectPromise = null;
+            }
+        }
+```
+首先会缓存连接状态，紧接着调用具体子类的doFinishConnect方法对连接结果进行判断，只要连接失败(连接失败或发生链路被关闭、链路终端等异常)
+doFinishConnect就会抛出Error，异常抛出之后，会关闭句柄释放资源，如果成功则调用fulfillConnectPromise方法，该方法的主要作用是将Channel的
+监听位修改为读操作位。最后会将超时定时任务取消。
