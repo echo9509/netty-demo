@@ -149,3 +149,23 @@ ChannelHandlerContext又维护了它的前后ChannelHandlerContext。getContextO
 
 然后调用newContext方法为新添加的ChannelHandler生成ChannelHandlerContext，并将其添加到合适的位置。加入成功，发送新增ChannelHandlerContext
 通知，也就是回调ChannelHandler.handlerAdded方法。
+
+## ChannelPipeline的outbound事件
+ChannelPipeline本身并不直接进行I/O操作，最终都是由Unsafe和Channel来实现真正的I/O操作。Pipeline负责将I/O事件通过TailHandler进行调度和传播，
+最终调用Unsafe的I/O方法进行I/O操作。
+```java
+    @Override
+    public final ChannelFuture connect(SocketAddress remoteAddress, ChannelPromise promise) {
+        return tail.connect(remoteAddress, promise);
+    }
+```
+他会直接调用TailHandler的connect方法，最终会调用到HeadHandler的connect方法，代码如下所示：
+```java
+        @Override
+        public void connect(
+                ChannelHandlerContext ctx,
+                SocketAddress remoteAddress, SocketAddress localAddress,
+                ChannelPromise promise) throws Exception {
+            unsafe.connect(remoteAddress, localAddress, promise);
+        }
+```
