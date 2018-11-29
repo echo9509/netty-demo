@@ -36,3 +36,20 @@ Outbound事件通常是由用户主动发起的网络I/O操作，例如用户发
 4. ChannelHandlerContext.read()：读事件
 5. ChannelHandlerContext.disconnect(ChannelPromise promise)：断开连接事件
 6. ChannelHandlerContext.close(ChannelPromise promise)：关闭当前Channel事件
+
+## 构建ChannelPipeline
+事实上，用户不需要自己创建ChannelPipeline，因为使用ServerBootstrap或者Bootstrap启动服务端或者客户端时，Netty会为每个Channel连接创建一个
+独立的pipeline。对于使用者来说，只需要将自定义的拦截器加入到pipeline中。
+
+对于编解码的ChannelHandler，存在先后顺序，例如MessageToMessageDecoder，在它之前往往需要有ByteToMessageDecoder将ByteBuf解码为对象，
+然后对对象做二次解码得到最终的POJO对象。
+
+ChannelPipeline支持指定位置添加和删除ChannelHandler
+
+## ChannelPipeline主要特性
+ChannelPipeline支持运行时动态添加或者删除ChannelHandler，在某些场景下这个特性非常实用。例如当业务高峰期时需要对系统做拥塞保护时，就可以
+根据当前的系统时间进行判断，如果处于业务高峰期，则动态地将系统拥塞保护ChannelHandler添加到当前的ChannelPipeline，当高峰过去时，就可以动
+态删除拥塞保护ChannelHandler。
+
+ChannelPipeline是线程安全的，这意味着N个业务线程可以并发地操作ChannelPipeline而不存在多线程并发问题。但是ChannelHandler不是线程安全的，
+意味着尽管ChannelPipeline是线程安全，但用户仍然需要自己保证ChannelHandler的线程安全。
