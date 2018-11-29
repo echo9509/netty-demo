@@ -60,6 +60,8 @@ ChannelPipeline实际上是一个ChannelHandler的容器，内部维护了一个
 
 ## ChannelPipeline类继承关系图
 
+![FeGQ1S.png](https://s1.ax1x.com/2018/11/29/FeGQ1S.png)
+
 ## ChannelPipeline对ChannelHandler的管理
 ChannelPipeline是ChannelHandler的管理容器，负责ChannelHandler的查询、添加、替换和删除。
 
