@@ -53,3 +53,99 @@ ChannelPipeline支持运行时动态添加或者删除ChannelHandler，在某些
 
 ChannelPipeline是线程安全的，这意味着N个业务线程可以并发地操作ChannelPipeline而不存在多线程并发问题。但是ChannelHandler不是线程安全的，
 意味着尽管ChannelPipeline是线程安全，但用户仍然需要自己保证ChannelHandler的线程安全。
+
+# ChannelPipeline源码
+ChannelPipeline实际上是一个ChannelHandler的容器，内部维护了一个ChannelHandler的链表和迭代器，可以方便地实现ChannelHandler查找、添加、
+替换和删除
+
+## ChannelPipeline类继承关系图
+
+## ChannelPipeline对ChannelHandler的管理
+ChannelPipeline是ChannelHandler的管理容器，负责ChannelHandler的查询、添加、替换和删除。
+
+```java
+    @Override
+    public final ChannelPipeline addBefore(String baseName, String name, ChannelHandler handler) {
+        return addBefore(null, baseName, name, handler);
+    }
+
+    @Override
+    public final ChannelPipeline addBefore(
+            EventExecutorGroup group, String baseName, String name, ChannelHandler handler) {
+        final AbstractChannelHandlerContext newCtx;
+        final AbstractChannelHandlerContext ctx;
+        synchronized (this) {
+            checkMultiplicity(handler);
+            name = filterName(name, handler);
+            ctx = getContextOrDie(baseName);
+
+            newCtx = newContext(group, name, handler);
+
+            addBefore0(ctx, newCtx);
+
+            // If the registered is false it means that the channel was not registered on an eventloop yet.
+            // In this case we add the context to the pipeline and add a task that will call
+            // ChannelHandler.handlerAdded(...) once the channel is registered.
+            if (!registered) {
+                newCtx.setAddPending();
+                callHandlerCallbackLater(newCtx, true);
+                return this;
+            }
+
+            EventExecutor executor = newCtx.executor();
+            if (!executor.inEventLoop()) {
+                newCtx.setAddPending();
+                executor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        callHandlerAdded0(newCtx);
+                    }
+                });
+                return this;
+            }
+        }
+        callHandlerAdded0(newCtx);
+        return this;
+    }
+```
+由于ChannelPipeline支持运行期动态修改，因此存在两种潜在的多线程并发访问场景：
+- I/O线程和用户业务线程的并发访问
+- 用户多个线程之间的并发访问
+
+Netty在此处使用了synchronized关键字，保证同步块内的所有操作的原子性。首先需要对添加的ChannelHandler做重复性校验，校验代码如下：
+```java
+    private static void checkMultiplicity(ChannelHandler handler) {
+        if (handler instanceof ChannelHandlerAdapter) {
+            ChannelHandlerAdapter h = (ChannelHandlerAdapter) handler;
+            if (!h.isSharable() && h.added) {
+                throw new ChannelPipelineException(
+                        h.getClass().getName() +
+                        " is not a @Sharable handler, so can't be added or removed multiple times.");
+            }
+            h.added = true;
+        }
+    }
+```
+如果ChannelHandler不是可以在多个ChannelPipeline中共享的，并且已经被添加到ChannelPipeline中，则抛出ChannelPipelineException异常。
+
+然后后对新增的ChannelHandler名进行重复性校验，在校验之前，如果没有传递名称，会自动生成一个名称，如果已经有同名的ChannelHandler存在，
+则不允许覆盖，会抛出IllegalArgumentException异常。
+
+接着baseName获取到对应的ChannelHandlerContext，ChannelPipeline维护了第一个ChannelHandlerContext和最后一个ChannelHandlerContext，
+ChannelHandlerContext又维护了它的前后ChannelHandlerContext。getContextOrDie最终会调取DefaultChannelPipeline的context0(String name)
+方法，方法如下：
+```java
+    private AbstractChannelHandlerContext context0(String name) {
+        AbstractChannelHandlerContext context = head.next;
+        while (context != tail) {
+            if (context.name().equals(name)) {
+                return context;
+            }
+            context = context.next;
+        }
+        return null;
+    }
+```
+
+然后调用newContext方法为新添加的ChannelHandler生成ChannelHandlerContext，并将其添加到合适的位置。加入成功，发送新增ChannelHandlerContext
+通知，也就是回调ChannelHandler.handlerAdded方法。
