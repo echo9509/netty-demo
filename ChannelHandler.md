@@ -32,7 +32,7 @@ MessageToMessageDecoder实际上是Netty的**二次解码器**，它的职责是
 用户的解码器只需要实现decode(ChannelHandlerContext ctx, I msg, List<Object> out)抽象方法即可，由于它是将一个POJO解码为另一个POJO，
 所以一般不会涉及到半包的处理。
 
-# LengthFieldBasedFrameDecoder
+# LengthFieldBasedFrameDecoder功能
 Netty提供的半包解码器有三种：
 - LineBasedFrameDecoder：以换行符区分一个整包进行解码，处理半包问题
 - DelimiterBasedFrameDecoder：以固定的分隔符为区分一个整包进行解码，处理半包问题
@@ -91,3 +91,22 @@ Netty提供的半包解码器有三种：
 - lengthFieldLength = 2
 - lengthAdjustment = 1
 - initialBytesToStrip = 3
+
+# MessageToByteEncoder功能
+这是一个抽象类，负责将Java的POJO对象编码成ByteBuf，用户的编码器只需要继承MessageToByteEncoder，实现它的encode(ChannelHandlerContext ctx, I msg, ByteBuf out)
+方法即可。
+
+# MessageToMessageEncoder功能
+该类将一个POJO对象转换成另一个对象，以HTTP+XML协议为例，它的一种实现方式是：将POJO对象编码成XML字符串，再将字符串编码成HTTP请求或者应答消息。
+
+用户的编码器只需要继承MessageToMessageEncoder编码器，实现encode(ChannelHandlerContext ctx, I msg, List<Object> out)方法即可。它与
+MessageToByteEncoder的区别是输出对象是对象列表而不是ByteBuf。
+
+# LengthFieldPrepender功能
+如果协议中的第一个字段为长度字段，Netty中提供了LengthFieldPrepender编码器，它可以计算当前待发送消息的二进制字节长度，并把该长度添加到ByteBuf的
+缓冲区头中,如下图所示：
+![FmIWE4.png](https://s1.ax1x.com/2018/11/30/FmIWE4.png)
+
+通过LengthFieldPrepender可以将待发送消息的长度写入到ByteBuf的前两个字节，编码后的消息组成为长度字段+原消息的方式。
+
+通过设置LengthFieldPrepender中的lengthIncludesLengthFieldLength属性为true，消息长度将包含长度本身占用的字节数。
