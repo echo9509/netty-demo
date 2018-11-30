@@ -110,3 +110,14 @@ MessageToByteEncoder的区别是输出对象是对象列表而不是ByteBuf。
 通过LengthFieldPrepender可以将待发送消息的长度写入到ByteBuf的前两个字节，编码后的消息组成为长度字段+原消息的方式。
 
 通过设置LengthFieldPrepender中的lengthIncludesLengthFieldLength属性为true，消息长度将包含长度本身占用的字节数。
+
+# ChannelHandler源码分析
+## ChannelHandler类关系
+相对于ByteBuf和Channel，ChannelHandler的类继承关系相对简单，但是它的子类非常多。由于ChannelHandler是Netty框架和用户代码的主要扩展和
+定制点，所以它的子类种类繁多、功能各异，系统ChannelHandler主要分类如下：
+- ChannelPipeline的系统ChannelHandler，用于I/O操作和对事件进行预处理，对于用户不可见，这类ChannelHandler主要包括HeadContext和TailContext
+- 编解码ChannelHandler，包括ByteToMessageCodec、MessageToMessageDecoder等，这些编解码类本身又包含多种子类。
+- 其他功能性ChannelHandler，包括流量整形Handler、读写超时Handler、日志Handler等
+
+下面的图片设计我们前面提到过得所有编解码器的继承关系
+![FmTllt.png](https://s1.ax1x.com/2018/11/30/FmTllt.png)
