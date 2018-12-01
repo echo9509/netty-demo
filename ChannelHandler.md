@@ -121,3 +121,121 @@ MessageToByteEncoder的区别是输出对象是对象列表而不是ByteBuf。
 
 下面的图片设计我们前面提到过得所有编解码器的继承关系
 ![FmTllt.png](https://s1.ax1x.com/2018/11/30/FmTllt.png)
+
+## ByteToMessageDecoder源码分析
+ByteToMessageDecoder解码器用于将ByteBuf解码成POJO对象。
+```java
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        if (msg instanceof ByteBuf) {
+            CodecOutputList out = CodecOutputList.newInstance();
+            try {
+                ByteBuf data = (ByteBuf) msg;
+                first = cumulation == null;
+                if (first) {
+                    cumulation = data;
+                } else {
+                    cumulation = cumulator.cumulate(ctx.alloc(), cumulation, data);
+                }
+                callDecode(ctx, cumulation, out);
+            } catch (DecoderException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new DecoderException(e);
+            } finally {
+                if (cumulation != null && !cumulation.isReadable()) {
+                    numReads = 0;
+                    cumulation.release();
+                    cumulation = null;
+                } else if (++ numReads >= discardAfterReads) {
+                    // We did enough reads already try to discard some bytes so we not risk to see a OOME.
+                    // See https://github.com/netty/netty/issues/4275
+                    numReads = 0;
+                    discardSomeReadBytes();
+                }
+
+                int size = out.size();
+                decodeWasNull = !out.insertSinceRecycled();
+                fireChannelRead(ctx, out, size);
+                out.recycle();
+            }
+        } else {
+            ctx.fireChannelRead(msg);
+        }
+    }
+```
+首先判断需要解码的是否是ByteBuf，如果是ByteBuf才需要解码，否则直接透传。
+
+接着通过cumulation是否为空判断解码器是否缓存了没有解码完成的半包消息，如果为空，说明是首次解码或者最近一次处理完了半包消息，没有缓存的半包消息
+需要处理，直接将需要解码的ByteBuf赋值给cumulation；如果cumulation缓存上有上次没有解码完成的ByteBuf，则进行复制操作，将需要解码的ByteBuf
+复制到cumulation中。
+
+复制操作完成之后释放需要解码的ByteBuf对象，调用callDecode方法进行解码。对ByteBuf进行循环解码，循环的条件是解码缓冲区对象中有可读的字节，
+调用decode方法，由用户的子类解码器进行解码。
+
+解码后需要对当前的pipeline状态和解码结果进行判断。如果当前ChannelHandlerContext已经被移除，则不能继续进行解码，直接退出循环；如果输出的
+out列表长度没有变化，说明没有解码没有成功，需要针对以下不同场景进行判断：
+1. 如果用户解码器没有消费ByteBuf，则说明是个半包消息，需要由I/O线程继续读取后续的数据报，在这种场景下腰退出循环
+2. 如果用户解码器消费了ByteBuf，说明解码可以继续进行。
+
+如果用户解码器没有消费ByteBuf，但是却解码出一个或者多个对象，这种行为被认为是非法的，需要抛出DecoderException异常。
+
+最后通过isSingleDecode进行判断，如果是单条消息解码器，第一次解码完成之后就退出循环。
+
+```java
+    protected void callDecode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        try {
+            while (in.isReadable()) {
+                int outSize = out.size();
+
+                if (outSize > 0) {
+                    fireChannelRead(ctx, out, outSize);
+                    out.clear();
+
+                    // Check if this handler was removed before continuing with decoding.
+                    // If it was removed, it is not safe to continue to operate on the buffer.
+                    //
+                    // See:
+                    // - https://github.com/netty/netty/issues/4635
+                    if (ctx.isRemoved()) {
+                        break;
+                    }
+                    outSize = 0;
+                }
+
+                int oldInputLength = in.readableBytes();
+                decodeRemovalReentryProtection(ctx, in, out);
+
+                // Check if this handler was removed before continuing the loop.
+                // If it was removed, it is not safe to continue to operate on the buffer.
+                //
+                // See https://github.com/netty/netty/issues/1664
+                if (ctx.isRemoved()) {
+                    break;
+                }
+
+                if (outSize == out.size()) {
+                    if (oldInputLength == in.readableBytes()) {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+
+                if (oldInputLength == in.readableBytes()) {
+                    throw new DecoderException(
+                            StringUtil.simpleClassName(getClass()) +
+                                    ".decode() did not read anything but decoded a message.");
+                }
+
+                if (isSingleDecode()) {
+                    break;
+                }
+            }
+        } catch (DecoderException e) {
+            throw e;
+        } catch (Exception cause) {
+            throw new DecoderException(cause);
+        }
+    }
+```
