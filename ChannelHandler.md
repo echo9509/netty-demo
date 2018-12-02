@@ -571,3 +571,70 @@ MessageToMessageEncoder负责将一个POJO对象编码成另一个POJO对象。
 如果是则由具体的编码子类负责完成，如果编码后的CodecOutputList为空，则说明编码失败，释放CodecOutputList的引用。
 
 如果编码成功，则遍历CodecOutputList，循环发送编码后的POJO对象。
+
+## LengthFieldPrepender源码
+LengthFieldPrepender负责在待发送的ByteBuf消息头中增加一个长度字段来标识消息的长度，它简化了用户的编码器的开发，使用户不需要额外去设置
+这个长度字段。
+
+首先对长短字段进行设置，如果需要包含消息长度自身，则在原来的长度的基础上再加上lengthFieldLength的长度。
+
+如果调整后的消息长度小于0，则抛出IllegalArgumentException异常。对消息长度自身所占的字节数进行判断，以便采用正确的方法将长度字段写入到
+ByteBuf中，一共有6中可能：
+- 长度字段所占字节为1：如果使用1个Byte字节代表消息长度，则最大长度需要小于256个字节。对长度校验，失败抛出异常，成功则创建新的ByteBuf并通过
+writeByte将长度值写入到ByteBuf中
+- 长度字段所占字节为2：如果使用2个Byte字节代表消息长度，则最大长度需要小于65536个字节。对长度校验，失败抛出异常，成功则创建新的ByteBuf并通过
+writeShort将长度值写入到ByteBuf中
+- 长度字段所占字节为3：如果使用3个Byte字节代表消息长度，则最大长度需要小于16777216个字节。对长度校验，失败抛出异常，成功则创建新的ByteBuf并通过
+writeMedium将长度值写入到ByteBuf中
+- 长度字段所占字节为4：创建新的ByteBuf，并通过writeInt方法将长度值写入到ByteBuf中
+- 长度字段所占字节为8：创建新的ByteBuf，并通过writeLonge方法将长度值写入到ByteBuf中。
+- 其他长度值：直接抛出Error
+
+最后将原需要发送的ByteBuf复制到List<Object> out中，完成编码。
+```java
+    @Override
+    protected void encode(ChannelHandlerContext ctx, ByteBuf msg, List<Object> out) throws Exception {
+        int length = msg.readableBytes() + lengthAdjustment;
+        if (lengthIncludesLengthFieldLength) {
+            length += lengthFieldLength;
+        }
+
+        if (length < 0) {
+            throw new IllegalArgumentException(
+                    "Adjusted frame length (" + length + ") is less than zero");
+        }
+
+        switch (lengthFieldLength) {
+        case 1:
+            if (length >= 256) {
+                throw new IllegalArgumentException(
+                        "length does not fit into a byte: " + length);
+            }
+            out.add(ctx.alloc().buffer(1).order(byteOrder).writeByte((byte) length));
+            break;
+        case 2:
+            if (length >= 65536) {
+                throw new IllegalArgumentException(
+                        "length does not fit into a short integer: " + length);
+            }
+            out.add(ctx.alloc().buffer(2).order(byteOrder).writeShort((short) length));
+            break;
+        case 3:
+            if (length >= 16777216) {
+                throw new IllegalArgumentException(
+                        "length does not fit into a medium integer: " + length);
+            }
+            out.add(ctx.alloc().buffer(3).order(byteOrder).writeMedium(length));
+            break;
+        case 4:
+            out.add(ctx.alloc().buffer(4).order(byteOrder).writeInt(length));
+            break;
+        case 8:
+            out.add(ctx.alloc().buffer(8).order(byteOrder).writeLong(length));
+            break;
+        default:
+            throw new Error("should not reach here");
+        }
+        out.add(msg.retain());
+    }
+```
