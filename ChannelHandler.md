@@ -273,3 +273,189 @@ MessageToMessageDecoder负责将一个POJO对象解码成另一个POJO对象。
 首先从本地ThreadLocal中获取一个CodecOutputList，然后判断该消息是不是已经被解码对象，如果已经被解码过，则直接添加到CodecOutputList中，
 如果没有，则需要解码消息并将其添加到CodecOutputList。最后对CodecOutputList进行便利，调用ChannelHandlerContext的fireChannelRead方法，
 通知后续的ChannelHandler继续进行处理。循环通知完成以后，需要将CodecOutputList进行释放。
+
+## LengthFieldBasedFrameDecoder源码
+这是基于长度的半包解码器。
+```java
+    @Override
+    protected final void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+        Object decoded = decode(ctx, in);
+        if (decoded != null) {
+            out.add(decoded);
+        }
+    }
+```
+入口方法会调用内部的decode(ChannelHandlerContext ctx, ByteBuf in)方法，如果解码成功，将其加入到输出的List<Object> out列表中。
+```java
+    protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+        if (discardingTooLongFrame) {
+            discardingTooLongFrame(in);
+        }
+    }
+```
+首先判断discardingTooLongFrame标识，看是否需要丢弃当前可读的字节缓冲区，如果为真，则执行丢弃操作。
+```java
+    private void discardingTooLongFrame(ByteBuf in) {
+        long bytesToDiscard = this.bytesToDiscard;
+        int localBytesToDiscard = (int) Math.min(bytesToDiscard, in.readableBytes());
+        in.skipBytes(localBytesToDiscard);
+        bytesToDiscard -= localBytesToDiscard;
+        this.bytesToDiscard = bytesToDiscard;
+
+        failIfNecessary(false);
+    }
+```
+判断需要丢弃的字节长度，由于丢弃的字节数不能大于当前缓冲区可读的字节数，所以需要通过Math.min函数进行选择，取bytesToDiscard和缓冲区可读
+字节数之中的最小值。计算获取需要丢弃的字节数之后，调用ByteBuf的skipBytes方法跳过需要忽略的字节长度，然后bytesToDiscard减去已经忽略的字
+节长度。最后判断是否已经达到需要忽略的字节数，达到的话对discardingTooLongFrame等进行置位，代码如下：
+```java
+    private void failIfNecessary(boolean firstDetectionOfTooLongFrame) {
+        if (bytesToDiscard == 0) {
+            // Reset to the initial state and tell the handlers that
+            // the frame was too large.
+            long tooLongFrameLength = this.tooLongFrameLength;
+            this.tooLongFrameLength = 0;
+            discardingTooLongFrame = false;
+            if (!failFast || firstDetectionOfTooLongFrame) {
+                fail(tooLongFrameLength);
+            }
+        } else {
+            // Keep discarding and notify handlers if necessary.
+            if (failFast && firstDetectionOfTooLongFrame) {
+                fail(tooLongFrameLength);
+            }
+        }
+    }
+```
+在进行字节丢弃操作之后，紧接着对当前缓冲区的可读字节数和长度偏移量进行对比，如果小于长度偏移量，则说明当前缓冲区的数据包不够，需要返回空，
+由I/O线程继续读取后续的数据包，代码如下所示：
+```java
+    protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+   
+        if (in.readableBytes() < lengthFieldEndOffset) {
+            return null;
+        }
+    }
+```
+接着通过读索引和lengthFieldOffset计算获取实际的长度索引，然后通过索引值获取消息报文的长度字段。
+```java
+    protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+
+        int actualLengthFieldOffset = in.readerIndex() + lengthFieldOffset;
+        long frameLength = getUnadjustedFrameLength(in, actualLengthFieldOffset, lengthFieldLength, byteOrder);
+    }
+```
+根据长度字段自身的字节长度进行判断，共有以下6中可能的取值：
+- 长度所占字节为1：通过ByteBuf的getUnsignedByte方法获取长度值
+- 长度所占字节为2：通过ByteBuf的getUnsignedShort方法获取长度值
+- 长度所占字节为3：通过ByteBuf的getUnsignedMedium方法获取长度值
+- 长度所占字节为4：通过ByteBuf的getUnsignedInt方法获取长度值
+- 长度所占字节为8：通过ByteBuf的getLong方法获取长度值
+- 其他长度不支持，抛出DecoderException异常
+```java
+    protected long getUnadjustedFrameLength(ByteBuf buf, int offset, int length, ByteOrder order) {
+        buf = buf.order(order);
+        long frameLength;
+        switch (length) {
+        case 1:
+            frameLength = buf.getUnsignedByte(offset);
+            break;
+        case 2:
+            frameLength = buf.getUnsignedShort(offset);
+            break;
+        case 3:
+            frameLength = buf.getUnsignedMedium(offset);
+            break;
+        case 4:
+            frameLength = buf.getUnsignedInt(offset);
+            break;
+        case 8:
+            frameLength = buf.getLong(offset);
+            break;
+        default:
+            throw new DecoderException(
+                    "unsupported lengthFieldLength: " + lengthFieldLength + " (expected: 1, 2, 3, 4, or 8)");
+        }
+        return frameLength;
+    }
+```
+获取长度之后，需要对长度进行合法性判断，同时根据其他解码参数进行长度调整。
+
+如果长度小于0，说明报文非法，跳过lengthFieldEndOffset字节，抛出CorruptedFrameException异常。
+
+根据lengthAdjustment和lengthFieldEndOffset字段进行长度修正，如果修正后的报文长度小于lengthFieldEndOffset，则说明是非法数据，
+需要抛出CorruptedFrameException异常。
+
+如果修正后的报文长度大于ByteBuf的最大容量，说明接收到的消息长度大于系统允许的最大长度上线，需要设置discardingTooLongFrame，计算需要
+丢弃的字节数，根据情况选择是否需要抛出解码异常。
+代码如下：
+```java
+    protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+    
+        if (frameLength < 0) {
+            failOnNegativeLengthField(in, frameLength, lengthFieldEndOffset);
+        }
+
+        frameLength += lengthAdjustment + lengthFieldEndOffset;
+
+        if (frameLength < lengthFieldEndOffset) {
+            failOnFrameLengthLessThanLengthFieldEndOffset(in, frameLength, lengthFieldEndOffset);
+        }
+
+        if (frameLength > maxFrameLength) {
+            exceededFrameLength(in, frameLength);
+            return null;
+        }
+    }
+```
+丢弃的策略如下：frameLength减去ByteBuf的可读字节数就是要丢弃的字节长度，如果需要丢弃的字节数discard小于缓冲区可读的字节数，则直接丢弃整包
+消息。如果需要丢弃的字节数大于当前的可读字节数，说明即便将当前所有可读的字节数全部丢弃，也无法完成任务，则设置discardingTooLongFrame为true，
+下次解码的时候继续丢弃。丢弃操作完成之后，调用failIfNecessary方法根据实际情况抛出异常。
+```java
+    private void exceededFrameLength(ByteBuf in, long frameLength) {
+        long discard = frameLength - in.readableBytes();
+        tooLongFrameLength = frameLength;
+
+        if (discard < 0) {
+            // buffer contains more bytes then the frameLength so we can discard all now
+            in.skipBytes((int) frameLength);
+        } else {
+            // Enter the discard mode and discard everything received so far.
+            discardingTooLongFrame = true;
+            bytesToDiscard = discard;
+            in.skipBytes(in.readableBytes());
+        }
+        failIfNecessary(true);
+    }
+```
+如果当前可读的字节数小于frameLength，说明是个半包消息，需要返回空，由I/O线程继续读取后续的数据包，等待下次解码。
+
+对需要忽略的消息头字段进行判断，如果长度大于消息长度frameLength，说明码流非法，需要忽略当前的数据包，抛出CorruptedFrameException异常。
+
+通过ByteBuf的skipBytes方法忽略消息头中不需要的字段，得到整包ByteBuf。
+
+通过extractFrame方法换区解码后的整包缓冲区消息。
+```java
+    protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+
+        // never overflows because it's less than maxFrameLength
+        int frameLengthInt = (int) frameLength;
+        if (in.readableBytes() < frameLengthInt) {
+            return null;
+        }
+
+        if (initialBytesToStrip > frameLengthInt) {
+            failOnFrameLengthLessThanInitialBytesToStrip(in, frameLength, initialBytesToStrip);
+        }
+        in.skipBytes(initialBytesToStrip);
+
+        // extract frame
+        int readerIndex = in.readerIndex();
+        int actualFrameLength = frameLengthInt - initialBytesToStrip;
+        ByteBuf frame = extractFrame(ctx, in, readerIndex, actualFrameLength);
+        in.readerIndex(readerIndex + actualFrameLength);
+        return frame;
+    }
+```
+extractFrame方法的具体执行逻辑是根据消息的实际长度分配一个新的ByteBuf对象，将需要解码的ByteBuf可读缓冲区复制到新创建的ByteBuf中并返回，
+返回之后更新原解码缓冲区ByteBuf为原读索引+消息报文的实际长度。
