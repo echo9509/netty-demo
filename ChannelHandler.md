@@ -508,3 +508,66 @@ MessageToByteEncoder负责将用户的POJO对象编码成ByteBuf。ßß
 - 如果缓冲区没有包含可发送的字节，则需要释放编码后的ByteBuf，写入一个空的ByteBuf到ChannelHandlerContext中。
 
 发送完成后，释放编码缓冲区的ByteBuf对象。
+
+## MessageToMessageEncoder源码
+MessageToMessageEncoder负责将一个POJO对象编码成另一个POJO对象。
+```java
+    @Override
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        CodecOutputList out = null;
+        try {
+            if (acceptOutboundMessage(msg)) {
+                out = CodecOutputList.newInstance();
+                @SuppressWarnings("unchecked")
+                I cast = (I) msg;
+                try {
+                    encode(ctx, cast, out);
+                } finally {
+                    ReferenceCountUtil.release(cast);
+                }
+
+                if (out.isEmpty()) {
+                    out.recycle();
+                    out = null;
+
+                    throw new EncoderException(
+                            StringUtil.simpleClassName(this) + " must produce at least one message.");
+                }
+            } else {
+                ctx.write(msg, promise);
+            }
+        } catch (EncoderException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new EncoderException(t);
+        } finally {
+            if (out != null) {
+                final int sizeMinusOne = out.size() - 1;
+                if (sizeMinusOne == 0) {
+                    ctx.write(out.get(0), promise);
+                } else if (sizeMinusOne > 0) {
+                    // Check if we can use a voidPromise for our extra writes to reduce GC-Pressure
+                    // See https://github.com/netty/netty/issues/2525
+                    ChannelPromise voidPromise = ctx.voidPromise();
+                    boolean isVoidPromise = promise == voidPromise;
+                    for (int i = 0; i < sizeMinusOne; i ++) {
+                        ChannelPromise p;
+                        if (isVoidPromise) {
+                            p = voidPromise;
+                        } else {
+                            p = ctx.newPromise();
+                        }
+                        ctx.write(out.getUnsafe(i), p);
+                    }
+                    ctx.write(out.getUnsafe(sizeMinusOne), promise);
+                }
+                out.recycle();
+            }
+        }
+    }
+```
+与之前的编码器类似，创建CodecOutputList对象，判断当前需要编码的对象是否是编码器可处理的类型，如果不是，则透传。
+
+如果是则由具体的编码子类负责完成，如果编码后的CodecOutputList为空，则说明编码失败，释放CodecOutputList的引用。
+
+如果编码成功，则遍历CodecOutputList，循环发送编码后的POJO对象。
