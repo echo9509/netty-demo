@@ -239,3 +239,37 @@ out列表长度没有变化，说明没有解码没有成功，需要针对以�
         }
     }
 ```
+## MessageToMessageDecoder源码
+MessageToMessageDecoder负责将一个POJO对象解码成另一个POJO对象。
+```java
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        CodecOutputList out = CodecOutputList.newInstance();
+        try {
+            if (acceptInboundMessage(msg)) {
+                @SuppressWarnings("unchecked")
+                I cast = (I) msg;
+                try {
+                    decode(ctx, cast, out);
+                } finally {
+                    ReferenceCountUtil.release(cast);
+                }
+            } else {
+                out.add(msg);
+            }
+        } catch (DecoderException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new DecoderException(e);
+        } finally {
+            int size = out.size();
+            for (int i = 0; i < size; i ++) {
+                ctx.fireChannelRead(out.getUnsafe(i));
+            }
+            out.recycle();
+        }
+    }
+```
+首先从本地ThreadLocal中获取一个CodecOutputList，然后判断该消息是不是已经被解码对象，如果已经被解码过，则直接添加到CodecOutputList中，
+如果没有，则需要解码消息并将其添加到CodecOutputList。最后对CodecOutputList进行便利，调用ChannelHandlerContext的fireChannelRead方法，
+通知后续的ChannelHandler继续进行处理。循环通知完成以后，需要将CodecOutputList进行释放。
