@@ -459,3 +459,52 @@ MessageToMessageDecoder负责将一个POJO对象解码成另一个POJO对象。
 ```
 extractFrame方法的具体执行逻辑是根据消息的实际长度分配一个新的ByteBuf对象，将需要解码的ByteBuf可读缓冲区复制到新创建的ByteBuf中并返回，
 返回之后更新原解码缓冲区ByteBuf为原读索引+消息报文的实际长度。
+
+## MessageToByteEncoder源码
+MessageToByteEncoder负责将用户的POJO对象编码成ByteBuf。ßß
+```java
+    @Override
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        ByteBuf buf = null;
+        try {
+            if (acceptOutboundMessage(msg)) {
+                @SuppressWarnings("unchecked")
+                I cast = (I) msg;
+                buf = allocateBuffer(ctx, cast, preferDirect);
+                try {
+                    encode(ctx, cast, buf);
+                } finally {
+                    ReferenceCountUtil.release(cast);
+                }
+
+                if (buf.isReadable()) {
+                    ctx.write(buf, promise);
+                } else {
+                    buf.release();
+                    ctx.write(Unpooled.EMPTY_BUFFER, promise);
+                }
+                buf = null;
+            } else {
+                ctx.write(msg, promise);
+            }
+        } catch (EncoderException e) {
+            throw e;
+        } catch (Throwable e) {
+            throw new EncoderException(e);
+        } finally {
+            if (buf != null) {
+                buf.release();
+            }
+        }
+    }
+```
+首先判断当前编码器是否支持需要发送的消息，如果不支持则直接透传；如果支持则判断缓冲区的类型，对于直接内存通过ioBuffer方法分配，对于堆内存
+通过heapBuffer分配(上述逻辑在allocateBuffer方法中)。
+
+编码使用的缓冲区分配完成之后，调用encode抽象方法进行编码。
+
+编码完成后，调用ReferenceCountUtil的release方法释放编码对象msg。对编码后的ByteBuf进行以下判断：
+- 如果缓冲区包含发送的字节，则调用ChannelHandlerContext的write方法发送ByteBuf
+- 如果缓冲区没有包含可发送的字节，则需要释放编码后的ByteBuf，写入一个空的ByteBuf到ChannelHandlerContext中。
+
+发送完成后，释放编码缓冲区的ByteBuf对象。
