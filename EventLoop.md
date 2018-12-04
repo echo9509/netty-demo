@@ -84,3 +84,100 @@ Netty的NioEventLoop并不是一个纯粹的I/O线程，它除了负责I/O的读
 ![Fu4yRI.png](https://s1.ax1x.com/2018/12/02/Fu4yRI.png)
 
 ## NioEventLoop
+因为NioEventLoop是一个Reactor线程，所以他肯定聚合了Selector多路复用器对象，代码如下：
+```java
+    /**
+     * The NIO {@link Selector}.
+     */
+    private Selector selector;
+    private Selector unwrappedSelector;
+    private SelectedSelectionKeySet selectedKeys;
+
+    private final SelectorProvider provider;
+```
+Selector的初始化直接调用Selector.open()方法就可以创建并打开一个新的Selector。Netty对Selector的selectedKeys进行了优化，用户可以通过
+io.netty.noKeySetOptimization开关决定是否要启用该优化项，默认不打开该优化功能。
+```java
+    private SelectorTuple openSelector() {
+        final Selector unwrappedSelector;
+        try {
+            unwrappedSelector = provider.openSelector();
+        } catch (IOException e) {
+            throw new ChannelException("failed to open a new selector", e);
+        }
+
+        if (DISABLE_KEYSET_OPTIMIZATION) {
+            return new SelectorTuple(unwrappedSelector);
+        }
+
+        final SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
+
+        Object maybeSelectorImplClass = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+                try {
+                    return Class.forName(
+                            "sun.nio.ch.SelectorImpl",
+                            false,
+                            PlatformDependent.getSystemClassLoader());
+                } catch (Throwable cause) {
+                    return cause;
+                }
+            }
+        });
+
+        if (!(maybeSelectorImplClass instanceof Class) ||
+                // ensure the current selector implementation is what we can instrument.
+                !((Class<?>) maybeSelectorImplClass).isAssignableFrom(unwrappedSelector.getClass())) {
+            if (maybeSelectorImplClass instanceof Throwable) {
+                Throwable t = (Throwable) maybeSelectorImplClass;
+                logger.trace("failed to instrument a special java.util.Set into: {}", unwrappedSelector, t);
+            }
+            return new SelectorTuple(unwrappedSelector);
+        }
+
+        final Class<?> selectorImplClass = (Class<?>) maybeSelectorImplClass;
+
+        Object maybeException = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+                try {
+                    Field selectedKeysField = selectorImplClass.getDeclaredField("selectedKeys");
+                    Field publicSelectedKeysField = selectorImplClass.getDeclaredField("publicSelectedKeys");
+
+                    Throwable cause = ReflectionUtil.trySetAccessible(selectedKeysField, true);
+                    if (cause != null) {
+                        return cause;
+                    }
+                    cause = ReflectionUtil.trySetAccessible(publicSelectedKeysField, true);
+                    if (cause != null) {
+                        return cause;
+                    }
+
+                    selectedKeysField.set(unwrappedSelector, selectedKeySet);
+                    publicSelectedKeysField.set(unwrappedSelector, selectedKeySet);
+                    return null;
+                } catch (NoSuchFieldException e) {
+                    return e;
+                } catch (IllegalAccessException e) {
+                    return e;
+                }
+            }
+        });
+
+        if (maybeException instanceof Exception) {
+            selectedKeys = null;
+            Exception e = (Exception) maybeException;
+            logger.trace("failed to instrument a special java.util.Set into: {}", unwrappedSelector, e);
+            return new SelectorTuple(unwrappedSelector);
+        }
+        selectedKeys = selectedKeySet;
+        logger.trace("instrumented a special java.util.Set into: {}", unwrappedSelector);
+        return new SelectorTuple(unwrappedSelector,
+                                 new SelectedSelectionKeySetSelector(unwrappedSelector, selectedKeySet));
+    }
+```
+如果没有开启优化，直接调用provider.openSelector()创建并打开多路复用器之后立即返回。
+
+如果开启了优化功能，需要通过反射的方式从Selector实例中获取selectedKeys和publicSelectedKeys，通过反射的方式使用Netty构造的selectedKeys
+的包装类SelectedSelectionKeySet将原有的selectedKeys替换掉。
