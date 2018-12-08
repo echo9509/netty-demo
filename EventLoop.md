@@ -181,3 +181,304 @@ io.netty.noKeySetOptimization开关决定是否要启用该优化项，默认不
 
 如果开启了优化功能，需要通过反射的方式从Selector实例中获取selectedKeys和publicSelectedKeys，通过反射的方式使用Netty构造的selectedKeys
 的包装类SelectedSelectionKeySet将原有的selectedKeys替换掉。
+
+下面看以下NioEventLoop的主要代码
+```java
+    @Override
+    protected void run() {
+        for (;;) {
+            try {
+                switch (selectStrategy.calculateStrategy(selectNowSupplier, hasTasks())) {
+                    case SelectStrategy.CONTINUE:
+                        continue;
+                    case SelectStrategy.SELECT:
+                        select(wakenUp.getAndSet(false));
+
+                        // 'wakenUp.compareAndSet(false, true)' is always evaluated
+                        // before calling 'selector.wakeup()' to reduce the wake-up
+                        // overhead. (Selector.wakeup() is an expensive operation.)
+                        //
+                        // However, there is a race condition in this approach.
+                        // The race condition is triggered when 'wakenUp' is set to
+                        // true too early.
+                        //
+                        // 'wakenUp' is set to true too early if:
+                        // 1) Selector is waken up between 'wakenUp.set(false)' and
+                        //    'selector.select(...)'. (BAD)
+                        // 2) Selector is waken up between 'selector.select(...)' and
+                        //    'if (wakenUp.get()) { ... }'. (OK)
+                        //
+                        // In the first case, 'wakenUp' is set to true and the
+                        // following 'selector.select(...)' will wake up immediately.
+                        // Until 'wakenUp' is set to false again in the next round,
+                        // 'wakenUp.compareAndSet(false, true)' will fail, and therefore
+                        // any attempt to wake up the Selector will fail, too, causing
+                        // the following 'selector.select(...)' call to block
+                        // unnecessarily.
+                        //
+                        // To fix this problem, we wake up the selector again if wakenUp
+                        // is true immediately after selector.select(...).
+                        // It is inefficient in that it wakes up the selector for both
+                        // the first case (BAD - wake-up required) and the second case
+                        // (OK - no wake-up required).
+                        
+                        if (wakenUp.get()) {
+                            selector.wakeup();
+                        }
+                        // fall through
+                    default:
+                }
+        }
+    }
+       
+    @Override
+    public int calculateStrategy(IntSupplier selectSupplier, boolean hasTasks) throws Exception {
+        return hasTasks ? selectSupplier.get() : SelectStrategy.SELECT;
+    }
+```
+首先selectStrategy.calculateStrategy主要是用来控制这次循环是执行跳过、select操作还是fallthrough。如果当前的NioEventLoop中还有未处理的
+task，则执行selectSupplier.get方法，该方法会直接调用selector的selectNow操作这个非阻塞方法，Selector.selectNow()则检查自从上次select到
+现在有没有可用的selection key，然后立即返回。执行完成之后会跳出switch执行下面的processSelectedKeys逻辑。
+
+为了高效的利用CPU，NioEventLoop只要有未消费的task，则优先消费task。
+
+如果没有task则需要进行一次select(wakenUp.getAndSet(false))操作，在这个方法的具体实现中会调用Selector的select方法，该方法是一个阻塞方法。
+select操作主要是检查当前的selection key，哪些是available。因为select操作是阻塞操作，如果不想等待，可以使用Selector的wakeUp操作来进行
+中断停止等待。但是如果当前没有select操作，那么下次执行的select或者selectNow操作会立即被唤醒。
+
+wakeUp操作是一个开销比较大的操作，于是NioEventLoop中声明了wakenUp(AtomicBoolean)字段，用于控制selector.wakeup()的调用。调用wakeup之前
+先wakenUp.compareAndSet(false, true)，如果set成功才执行Selector.wakeup()操作。
+
+当用户提交新的任务时executor.execute(...)，会触发wakeup操作。
+
+在上面的代码中有一堆注释，解释了上述代码为什么那样实现，说明了产生竞态条件的原因：在执行完wakenUp.getAndSet(false)之后，用户发起了
+wakeup操作，然后执行select操作，这时select将立即返回。直到下次循环把wakeUp重新置为false，这期间所有的wakenUp.compareAndSet(false, true)
+都会失败，因为现在wakeUp的值是true。所以接下来的select()都不能被wakeup。
+
+下面看一下NioEventLoop的select操作：
+```java
+    private void select(boolean oldWakenUp) throws IOException {
+        Selector selector = this.selector;
+        try {
+            int selectCnt = 0;
+            long currentTimeNanos = System.nanoTime();
+            long selectDeadLineNanos = currentTimeNanos + delayNanos(currentTimeNanos);
+            for (;;) {
+                long timeoutMillis = (selectDeadLineNanos - currentTimeNanos + 500000L) / 1000000L;
+                if (timeoutMillis <= 0) {
+                    if (selectCnt == 0) {
+                        selector.selectNow();
+                        selectCnt = 1;
+                    }
+                    break;
+                }
+
+                // If a task was submitted when wakenUp value was true, the task didn't get a chance to call
+                // Selector#wakeup. So we need to check task queue again before executing select operation.
+                // If we don't, the task might be pended until select operation was timed out.
+                // It might be pended until idle timeout if IdleStateHandler existed in pipeline.
+                if (hasTasks() && wakenUp.compareAndSet(false, true)) {
+                    selector.selectNow();
+                    selectCnt = 1;
+                    break;
+                }
+
+                int selectedKeys = selector.select(timeoutMillis);
+                selectCnt ++;
+
+                if (selectedKeys != 0 || oldWakenUp || wakenUp.get() || hasTasks() || hasScheduledTasks()) {
+                    // - Selected something,
+                    // - waken up by user, or
+                    // - the task queue has a pending task.
+                    // - a scheduled task is ready for processing
+                    break;
+                }
+                if (Thread.interrupted()) {
+                    // Thread was interrupted so reset selected keys and break so we not run into a busy loop.
+                    // As this is most likely a bug in the handler of the user or it's client library we will
+                    // also log it.
+                    //
+                    // See https://github.com/netty/netty/issues/2426
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Selector.select() returned prematurely because " +
+                                "Thread.currentThread().interrupt() was called. Use " +
+                                "NioEventLoop.shutdownGracefully() to shutdown the NioEventLoop.");
+                    }
+                    selectCnt = 1;
+                    break;
+                }
+
+                long time = System.nanoTime();
+                if (time - TimeUnit.MILLISECONDS.toNanos(timeoutMillis) >= currentTimeNanos) {
+                    // timeoutMillis elapsed without anything selected.
+                    selectCnt = 1;
+                } else if (SELECTOR_AUTO_REBUILD_THRESHOLD > 0 &&
+                        selectCnt >= SELECTOR_AUTO_REBUILD_THRESHOLD) {
+                    // The selector returned prematurely many times in a row.
+                    // Rebuild the selector to work around the problem.
+                    logger.warn(
+                            "Selector.select() returned prematurely {} times in a row; rebuilding Selector {}.",
+                            selectCnt, selector);
+
+                    rebuildSelector();
+                    selector = this.selector;
+
+                    // Select again to populate selectedKeys.
+                    selector.selectNow();
+                    selectCnt = 1;
+                    break;
+                }
+
+                currentTimeNanos = time;
+            }
+
+            if (selectCnt > MIN_PREMATURE_SELECTOR_RETURNS) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Selector.select() returned prematurely {} times in a row for Selector {}.",
+                            selectCnt - 1, selector);
+                }
+            }
+        } catch (CancelledKeyException e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug(CancelledKeyException.class.getSimpleName() + " raised by a Selector {} - JDK bug?",
+                        selector, e);
+            }
+            // Harmless exception - log anyway
+        }
+    }
+```
+selectCnt标记select执行的次数，用于检测NIO的epoll bug。在这个方法尾部有一个判断：
+```java
+if (SELECTOR_AUTO_REBUILD_THRESHOLD > 0 &&
+                        selectCnt >= SELECTOR_AUTO_REBUILD_THRESHOLD)
+```
+判断select执行的次数是否超过阀值，如果是的话有可能触发了NIO的epoll bug，执行重建selector的逻辑：新建一个Selector，把老的Selection Key
+全部复制到新的Selector上，重建之后立即执行一次selectNow。
+
+因为select操作是阻塞的，如果长时间没有IO可用，就会造成NioEventLoop的task积压。因此每一次select操作都必须要设置一个超时时间：
+1. 查询定时任务最近要被执行的task还有多长时间执行，
+2. 这个时间加上0.5s就是最大超时时间
+```java
+long selectDeadLineNanos = currentTimeNanos + delayNanos(currentTimeNanos);
+long timeoutMillis = (selectDeadLineNanos - currentTimeNanos + 500000L) / 1000000L;
+```
+看一下select中的for循环：
+1. 第一个if：如果timeoutMillis<=0，立即执行一次selectNow，然后退出循环消费task
+2. 第二个if：如果当前的TaskQueue中还有任务，并且没有被wakeup，则执行一次selectNow，跳出循环消费task
+3. 接下来执行select操作，并计次
+4. 第三个if：判断是否有available keys或者被用户线程唤醒或者任务队列、定时队列中有任务则中断
+5. 最后就是重建Selector
+
+NioEventLoop.run方法的后半段逻辑主要是processSelectedKeys(处理IO)和runTasks(消费任务)。这里有一个参数用于控制处理这两种任务的时间
+配比：ioRatio
+```java
+                final int ioRatio = this.ioRatio;
+                if (ioRatio == 100) {
+                    try {
+                        processSelectedKeys();
+                    } finally {
+                        // Ensure we always run tasks.
+                        runAllTasks();
+                    }
+                } else {
+                    final long ioStartTime = System.nanoTime();
+                    try {
+                        processSelectedKeys();
+                    } finally {
+                        // Ensure we always run tasks.
+                        final long ioTime = System.nanoTime() - ioStartTime;
+                        runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
+                    }
+                }
+```
+先来看一下processSelectedKeys，它的逻辑由processSelectedKeysOptimized和processSelectedKeysPlain实现，调用那个函数取决于你是否开启了
+DISABLE_KEYSET_OPTIMIZATION。如果开启了Selection优化选项，则在创建Selector的时候以反射的方式把SelectedSelectionKeySet selectedKeys
+设置到selector中。具体实现在openSelector中，代码就不贴出来了。SelectedSelectionKeySet内部是基于Array实现的，而Selector内部selectedKeys
+是Set类型的，遍历效率Array效率更好一下。
+
+下面看一下processSelectedKeysPlain的实现
+```java
+    private void processSelectedKeysPlain(Set<SelectionKey> selectedKeys) {
+        if (selectedKeys.isEmpty()) {
+            return;
+        }
+
+        Iterator<SelectionKey> i = selectedKeys.iterator();
+        for (;;) {
+            final SelectionKey k = i.next();
+            final Object a = k.attachment();
+            i.remove();
+
+            if (a instanceof AbstractNioChannel) {
+                processSelectedKey(k, (AbstractNioChannel) a);
+            } else {
+                @SuppressWarnings("unchecked")
+                NioTask<SelectableChannel> task = (NioTask<SelectableChannel>) a;
+                processSelectedKey(k, task);
+            }
+
+            if (!i.hasNext()) {
+                break;
+            }
+
+            if (needsToSelectAgain) {
+                selectAgain();
+                selectedKeys = selector.selectedKeys();
+
+                // Create the iterator again to avoid ConcurrentModificationException
+                if (selectedKeys.isEmpty()) {
+                    break;
+                } else {
+                    i = selectedKeys.iterator();
+                }
+            }
+        }
+    }
+    private void processSelectedKey(SelectionKey k, AbstractNioChannel ch) {
+        final AbstractNioChannel.NioUnsafe unsafe = ch.unsafe();
+        if (!k.isValid()) {
+            final EventLoop eventLoop;
+            try {
+                eventLoop = ch.eventLoop();
+            } catch (Throwable ignored) {
+                return;
+            }
+            if (eventLoop != this || eventLoop == null) {
+                return;
+            }
+            unsafe.close(unsafe.voidPromise());
+            return;
+        }
+
+        try {
+            int readyOps = k.readyOps();
+            if ((readyOps & SelectionKey.OP_CONNECT) != 0) {
+                int ops = k.interestOps();
+                ops &= ~SelectionKey.OP_CONNECT;
+                k.interestOps(ops);
+
+                unsafe.finishConnect();
+            }
+
+            if ((readyOps & SelectionKey.OP_WRITE) != 0) {
+                ch.unsafe().forceFlush();
+            }
+
+            if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
+                unsafe.read();
+            }
+        } catch (CancelledKeyException ignored) {
+            unsafe.close(unsafe.voidPromise());
+        }
+    }
+```
+SelectionKey上边可以挂载Attachment，一般情况下新的链接对象Channel会挂到attachment上。我们在遍历selectedKeys时，首先取出selection key
+上的attachment，key的类型可能是AbstractNioChannel和NioTask。根据不同的类型调用不同的处理函数。我们着重看处理channel的逻辑：
+1. 如果selection key是：SelectionKey.OP_CONNECT，那表明这是一个链接操作。对于链接操作，我们需要把这个selection key从interestOps中清除掉，
+否则下次select操作会直接返回。接下来调用finishConnect方法。
+2. 如果selection key是：SelectionKey.OP_WRITE。则执行flush操作，把数据刷到客户端。
+3. 如果是read操作则调用unsafe.read()。
+
+整体来看NioEventLoop的实现也不复杂，主要就干了两件事情：select IO以及消费task。因为select操作是阻塞的（尽管设置了超时时间），每次执行select时
+都会检查是否有新的task，有则优先执行task。这么做也是做大限度的提高EventLoop的吞吐量，减少阻塞时间。除了这两件事儿，NioEventLoop还解决了JDK中注明
+的EPoll bug。
